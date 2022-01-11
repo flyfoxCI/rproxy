@@ -14,8 +14,11 @@ pub struct Args {
     #[structopt(short, long, global = true, parse(from_occurrences))]
     pub verbose: u8,
     /// The address to bind to
-    #[structopt(short = "B", long, default_value = "127.0.0.1:1080")]
-    pub bind: SocketAddr,
+    #[structopt(short = "S", long, default_value = "127.0.0.1:9089")]
+    pub socks5_bind: SocketAddr,
+    /// The path to the proxy list to use
+    #[structopt(short = "H", long, default_value = "127.0.0.1:9099")]
+    pub http_bind: SocketAddr,
     /// The path to the proxy list to use
     #[structopt(short = "L", long)]
     pub proxy_list: PathBuf,

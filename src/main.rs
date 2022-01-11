@@ -1,10 +1,14 @@
 // https://github.com/rust-lang/rust-clippy/issues/7271
 #![allow(clippy::needless_lifetimes)]
 
+extern crate anyhow;
+
 pub mod args;
 pub mod errors;
 pub mod list;
 pub mod socks5;
+pub mod http;
+mod redis_util;
 
 use crate::args::Args;
 use crate::errors::*;
@@ -14,6 +18,7 @@ use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
+use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,13 +41,16 @@ async fn main() -> Result<()> {
         .context("Failed to load proxy list")?;
     let proxies = ArcSwap::from(Arc::new(proxies));
 
-    info!("Binding listener to {}", args.bind);
-    let listener = TcpListener::bind(args.bind).await?;
+    info!("Binding socks5 listener to {}", args.socks5_bind);
+    let socks5_listener = TcpListener::bind(args.socks5_bind).await?;
+    info!("Binding http listener to {}", args.http_bind);
+    let http_listener = TcpListener::bind(args.http_bind).await?;
+
 
     loop {
         tokio::select! {
-            res = listener.accept() => {
-                let (socket, src) = match res {
+            s5_res = socks5_listener.accept() => {
+                let (socket, src) = match s5_res {
                     Ok(x) => x,
                     Err(err) => {
                         error!("Failed to accept connection: {:#}", err);
@@ -53,6 +61,22 @@ async fn main() -> Result<()> {
                 let proxies = proxies.load();
                 tokio::spawn(async move {
                     if let Err(err) = socks5::serve(socket, proxies.clone()).await {
+                        warn!("Error serving client: {:#}", err);
+                    }
+                });
+            }
+            http_res = http_listener.accept()=>{
+                let(socket,src) = match http_res{
+                    Ok(x)=>x,
+                    Err(err)=>{
+                        error!("failed to accept http connection: {:#}",err);
+                        continue;
+                    },
+                };
+                debug!("Got connection from {}",src);
+                let proxies = proxies.load();
+                tokio::spawn(async move{
+                    if let Err(err) = http::serve(socket,proxies.clone()).await{
                         warn!("Error serving client: {:#}", err);
                     }
                 });
