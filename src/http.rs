@@ -32,31 +32,3 @@ async fn transfer(mut inbound: TcpStream, proxy_addr: &SocketAddr) -> Result<(),
 
     Ok(())
 }
-
-
-async fn get_proxies() -> Vec<String> {
-    let proxies_path = std::env::var("PROXY_PATH")
-        .expect("Please specify absolute path in PROXY_PATH environment variable");
-
-    let mut proxies_file_handle = File::open(proxies_path)
-        .await
-        .expect("Unable to open proxy file");
-
-    let mut proxies_file_content = vec![];
-
-    proxies_file_handle
-        .read_to_end(&mut proxies_file_content)
-        .await
-        .expect("Unable to read proxy file");
-
-    let proxies_ =
-        String::from_utf8(proxies_file_content).expect("Cant convert prixes content to string");
-
-    let mut proxies = vec![];
-
-    proxies_
-        .split("\n")
-        .for_each(|proxy| proxies.push(String::from(proxy)));
-
-    proxies
-}
