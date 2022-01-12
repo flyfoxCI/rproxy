@@ -1,29 +1,29 @@
 use std::collections::HashSet;
-use std::error::Error;
 use std::net::SocketAddr;
-use anyhow::anyhow;
-use log::error;
-use redis::{Commands, Connection};
+use anyhow::{Context};
+use crate::errors::*;
+use mobc::{Pool};
+use mobc_redis::RedisConnectionManager;
+use mobc_redis::{redis};
+use mobc_redis::redis::aio::Connection;
 
-pub async fn get_proxies(redis_url:String,proxy_key:String) -> Result<Vec<SocketAddr>,Box<dyn Error>> {
+pub async fn get_proxies(pool: &Pool<RedisConnectionManager>, redis_key: &String) -> Result<Vec<SocketAddr>> {
+    let mut conn = pool.get().await?;
     let mut proxies = Vec::new();
-    let mut conn = conn_redis(redis_url).ok().unwrap();
-    let results:HashSet<String> =conn.hgetall(proxy_key)?;
-    for r in results {
-        let proxy = match r.parse::<SocketAddr>(){
+    let results: HashSet<String> = redis::cmd("hgetall")
+        .arg(redis_key)
+        .query_async(&mut conn as &mut Connection)
+        .await
+        .context("fail to get key from redis")?;
+    for r in results.iter() {
+        let proxy = match r.parse::<SocketAddr>() {
             Ok(proxy) => proxy,
             Err(err) => {
-                error!(err);
+                error!("parse addr error: {}",err);
                 continue;
-            },
+            }
         };
         proxies.push(proxy);
     }
     Ok(proxies)
-}
-
-fn conn_redis(&url:String) -> redis::RedisResult<Connection> {
-    let client = redis::Client::open(url)?;
-    let con = client.get_connection()?;
-    Ok(con)
 }

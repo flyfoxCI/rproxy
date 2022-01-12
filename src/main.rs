@@ -19,6 +19,8 @@ use structopt::StructOpt;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use anyhow::Result;
+use mobc::Pool;
+use mobc_redis::{redis, RedisConnectionManager};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,17 +37,16 @@ async fn main() -> Result<()> {
 
     // a stream of sighup signals
     let mut sighup = signal(SignalKind::hangup())?;
-
-    let proxies = list::load_from_path(&args.proxy_list)
-        .await
-        .context("Failed to load proxy list")?;
-    let proxies = ArcSwap::from(Arc::new(proxies));
-
     info!("Binding socks5 listener to {}", args.socks5_bind);
     let socks5_listener = TcpListener::bind(args.socks5_bind).await?;
     info!("Binding http listener to {}", args.http_bind);
     let http_listener = TcpListener::bind(args.http_bind).await?;
 
+
+    let client = redis::Client::open(args.redis_url).unwrap();
+    let manager = RedisConnectionManager::new(client);
+    let pool = Pool::builder().max_open(10).build(manager);
+    let redis_key = args.redis_key;
 
     loop {
         tokio::select! {
@@ -58,9 +59,10 @@ async fn main() -> Result<()> {
                     },
                 };
                 debug!("Got new client connection from {}", src);
-                let proxies = proxies.load();
+                let pool = pool.clone();
+                let key = redis_key.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = socks5::serve(socket, proxies.clone()).await {
+                    if let Err(err) = socks5::serve(socket, &pool,&key).await {
                         warn!("Error serving client: {:#}", err);
                     }
                 });
@@ -74,24 +76,24 @@ async fn main() -> Result<()> {
                     },
                 };
                 debug!("Got connection from {}",src);
-                let proxies = proxies.load();
-                tokio::spawn(async move{
-                    if let Err(err) = http::serve(socket,proxies.clone()).await{
+                 let pool = pool.clone();
+                 let key = redis_key.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = http::serve(socket,&pool,&key).await{
                         warn!("Error serving client: {:#}", err);
                     }
                 });
             }
             _ = sighup.recv() => {
                 debug!("Got signal HUP");
-                match list::load_from_path(&args.proxy_list).await {
-                    Ok(list) => {
-                        let list = Arc::new(list);
-                        proxies.store(list);
-                    }
-                    Err(err) => {
-                        error!("Failed to reload proxy list: {:#}", err);
-                    }
-                }
+                // match redis_util::get_random_proxy(&pool,redis_key).await {
+                //     Ok(x) => {
+                //
+                //     }
+                //     Err(err) => {
+                //         error!("Failed to reload proxy list: {:#}", err);
+                //     }
+                // }
             }
         }
     }

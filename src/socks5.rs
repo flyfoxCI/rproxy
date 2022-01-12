@@ -3,9 +3,11 @@ use bstr::ByteSlice;
 use rand::prelude::SliceRandom;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use mobc::Pool;
+use mobc_redis::RedisConnectionManager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use crate::redis_util::get_proxies;
 
 pub enum SocksAddr<'a> {
     Ipv4(&'a [u8]),
@@ -168,20 +170,20 @@ async fn connect(proxy_addr: &SocketAddr, addr: &SocksAddr<'_>, port: u16) -> Re
     Ok(proxy)
 }
 
-pub async fn serve(mut socket: TcpStream, proxies: Arc<Vec<SocketAddr>>) -> Result<()> {
+pub async fn serve(mut socket: TcpStream, pool:&Pool<RedisConnectionManager>,redis_key:&String) -> Result<()> {
     let mut buf = [0u8; 255];
     let (addr, port) = recv_handshake(&mut socket, &mut buf)
         .await
         .context("Failed to complete handshake with client")?;
 
     debug!("Received connection request for {}:{}", addr, port);
-
+    let proxies = get_proxies(pool,redis_key).await?;
     let proxy = proxies
         .choose(&mut rand::thread_rng())
         .context("No proxies configured")?;
     debug!("Picked random proxy: {}", proxy);
 
-    let mut proxy = connect(proxy, &addr, port)
+    let mut proxy = connect(&proxy, &addr, port)
         .await
         .context("Failed to complete handshake with proxy")?;
 
