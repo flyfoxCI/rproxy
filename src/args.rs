@@ -19,9 +19,9 @@ pub struct Args {
     #[structopt(short = "H", long, default_value = "127.0.0.1:9099")]
     pub http_bind: SocketAddr,
     /// The redis url
-    #[structopt(short="redis",long,default_value="127.0.0.1:6379")]
+    #[structopt(short="redis",long,default_value="redis://:WEsdfs112@127.0.0.1:6379")]
     pub redis_url: String,
     /// redis key
-    #[structopt(short="key", long)]
+    #[structopt(short="key", long, default_value="proxy:pool")]
     pub redis_key: String,
 }

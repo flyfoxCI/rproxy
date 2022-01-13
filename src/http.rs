@@ -20,6 +20,7 @@ pub async fn serve(socket: TcpStream, pool: &Pool<RedisConnectionManager>,redis_
 }
 
 async fn transfer(mut inbound: TcpStream, proxy_addr: &SocketAddr) -> Result<(), Box<dyn Error>> {
+    println!("{}", proxy_addr.to_string());
     let mut outbound = TcpStream::connect(proxy_addr).await?;
 
     // tokio::io::copy_bidirectional(&mut inbound, &mut outbound)

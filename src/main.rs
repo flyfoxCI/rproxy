@@ -12,9 +12,7 @@ mod redis_util;
 
 use crate::args::Args;
 use crate::errors::*;
-use arc_swap::ArcSwap;
 use env_logger::Env;
-use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
