@@ -177,7 +177,7 @@ pub async fn serve(mut socket: TcpStream, pool:&Pool<RedisConnectionManager>,red
         .context("Failed to complete handshake with client")?;
 
     debug!("Received connection request for {}:{}", addr, port);
-    let proxies = get_proxies(pool,redis_key).await?;
+    let proxies = get_proxies(pool,redis_key,"socks5").await?;
     let proxy = proxies
         .choose(&mut rand::thread_rng())
         .context("No proxies configured")?;

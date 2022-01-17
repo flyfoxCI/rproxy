@@ -15,7 +15,7 @@ use crate::errors::*;
 use env_logger::Env;
 use structopt::StructOpt;
 use tokio::net::TcpListener;
-use tokio::signal::unix::{signal, SignalKind};
+// use tokio::signal::unix::{signal, SignalKind};
 use anyhow::Result;
 use mobc::Pool;
 use mobc_redis::{redis, RedisConnectionManager};
@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     env_logger::init_from_env(Env::default().default_filter_or(logging));
 
     // a stream of sighup signals
-    let mut sighup = signal(SignalKind::hangup())?;
+    // let mut sighup = signal(SignalKind::hangup())?;
     info!("Binding socks5 listener to {}", args.socks5_bind);
     let socks5_listener = TcpListener::bind(args.socks5_bind).await?;
     info!("Binding http listener to {}", args.http_bind);
@@ -82,17 +82,17 @@ async fn main() -> Result<()> {
                     }
                 });
             }
-            _ = sighup.recv() => {
-                debug!("Got signal HUP");
-                // match redis_util::get_random_proxy(&pool,redis_key).await {
-                //     Ok(x) => {
-                //
-                //     }
-                //     Err(err) => {
-                //         error!("Failed to reload proxy list: {:#}", err);
-                //     }
-                // }
-            }
+            // _ = sighup.recv() => {
+            //     debug!("Got signal HUP");
+            //     match redis_util::get_random_proxy(&pool,redis_key).await {
+            //         Ok(x) => {
+            //
+            //         }
+            //         Err(err) => {
+            //             error!("Failed to reload proxy list: {:#}", err);
+            //         }
+            //     }
+            // }
         }
     }
 }

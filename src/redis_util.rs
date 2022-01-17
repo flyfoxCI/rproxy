@@ -7,11 +7,12 @@ use mobc_redis::RedisConnectionManager;
 use mobc_redis::{redis};
 use mobc_redis::redis::aio::Connection;
 
-pub async fn get_proxies(pool: &Pool<RedisConnectionManager>, redis_key: &String) -> Result<Vec<SocketAddr>> {
+pub async fn get_proxies(pool: &Pool<RedisConnectionManager>, redis_key: &String,prefix:&str) -> Result<Vec<SocketAddr>> {
     let mut conn = pool.get().await?;
     let mut proxies = Vec::new();
-    let results: HashSet<String> = redis::cmd("hgetall")
-        .arg(redis_key)
+    let redis_key_str = format!("{}:{}", redis_key, prefix);
+    let results: HashSet<String> = redis::cmd("hkeys")
+        .arg(redis_key_str)
         .query_async(&mut conn as &mut Connection)
         .await
         .context("fail to get key from redis")?;

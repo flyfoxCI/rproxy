@@ -11,7 +11,7 @@ use tokio::io;
 use crate::redis_util::{get_proxies};
 
 pub async fn serve(socket: TcpStream, pool: &Pool<RedisConnectionManager>,redis_key:&String) -> Result<(), Box<dyn Error>> {
-    let proxies = get_proxies(pool,redis_key).await?;
+    let proxies = get_proxies(pool,redis_key, "http").await?;
     let proxy = proxies
         .choose(&mut rand::thread_rng())
         .context("No proxies configured")?;
