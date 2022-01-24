@@ -39,7 +39,7 @@ after that you can start rproxy
 
 ```shell script
 curl -x http://127.0.0.1:9099 https://icanhazip.com/
-curl -x socks5://127.0.0.8099 https://icanhazip.com/
+curl -x socks5://127.0.0.9089 https://icanhazip.com/
 ```
 
 # roadmap
