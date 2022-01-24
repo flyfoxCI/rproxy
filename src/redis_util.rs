@@ -17,7 +17,6 @@ pub async fn get_proxies(pool: &Pool<RedisConnectionManager>, redis_key: &String
         .await
         .context("fail to get key from redis")?;
     for r in results.iter() {
-        println!("{}",r);
         let proxy = match r.parse::<SocketAddr>() {
             Ok(proxy) => proxy,
             Err(err) => {
