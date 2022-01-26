@@ -24,16 +24,16 @@ class BaseCheck(object):
         self.concurrency = concurrency
         self.conn = self.createConn()
         self.redis_key = REDIS_KEY + ":" + payload_proto
+        self.pool = AioPool(processes=4, concurrency_limit=self.concurrency)
 
     def createConn(self):
         conn = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD)
         return conn
 
     def run(self):
-        pool = AioPool(processes=4, concurrency_limit=self.concurrency)
         proxy_list = self.getProxyList(self.redis_key)
         proxy_list = [p.decode() for p in proxy_list]
-        results = pool.map(self.check, [p for p in proxy_list])
+        results = self.pool.map(self.check, [p for p in proxy_list])
         to_delete = []
         to_update = {}
         for r in results:

@@ -25,6 +25,7 @@ class BaseCrawler(object):
         self.redis_key = REDIS_KEY + ":" + payload_proto
         self.url = proxy_url
         self.max_capacity = max_capacity
+        self.pool = AioPool(processes=1, concurrency_limit=self.concurrency)
 
     def createConn(self):
         conn = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD)
@@ -38,10 +39,9 @@ class BaseCrawler(object):
         proxies_cap = self.getCapacity()
         if proxies_cap > self.max_capacity:
             return
-        pool = AioPool(processes=1, concurrency_limit=self.concurrency)
         proxy_list = self.getProxyList(self.url)
         #print(proxy_list)
-        results = pool.map(self.check, [p for p in proxy_list])
+        results = self.pool.map(self.check, [p for p in proxy_list])
         to_add = {}
         for r in results:
             flag, proxy = r
