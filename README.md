@@ -3,6 +3,7 @@
 ## what is rproxy 
 rproxy is a rotate proxy for crawler which can call the proxy of proxy.
 it build a pool of proxies and you can set the address as proxy of your application 
+the project wiki https://deepwiki.com/flyfoxCI/rproxy/1-overview 
 
 ## build and compile 
 cargo build --release
