@@ -71,7 +71,10 @@ jobs:
         run: |
           target_env="${TARGET//-/_}"
           printf 'CC_%s=musl-gcc\n' "$target_env" >> "$GITHUB_ENV"
-          printf 'CARGO_TARGET_%s_LINKER=musl-gcc\n' "${target_env^^}" >> "$GITHUB_ENV"
+          # Keep the proven Rust default linker on x86_64; overriding it broke startup.
+          if [[ "$TARGET" == "aarch64-unknown-linux-musl" ]]; then
+            printf 'CARGO_TARGET_%s_LINKER=musl-gcc\n' "${target_env^^}" >> "$GITHUB_ENV"
+          fi
       - name: Prepare Rust target
         shell: bash
         env:
