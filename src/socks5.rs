@@ -1,197 +1,128 @@
-use crate::errors::*;
-use bstr::ByteSlice;
-use rand::prelude::SliceRandom;
-use std::fmt;
-use std::net::SocketAddr;
-use mobc::Pool;
-use mobc_redis::RedisConnectionManager;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use crate::redis_util::get_proxies;
+use anyhow::{bail, Context, Result};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
-pub enum SocksAddr<'a> {
-    Ipv4(&'a [u8]),
-    Domain(&'a [u8]),
-    Ipv6(&'a [u8]),
-}
+use crate::{
+    auth::Identity,
+    server::{relay, State},
+    upstream::{ConnectError, Target},
+};
 
-impl<'a> fmt::Display for SocksAddr<'a> {
-    fn fmt(&self, w: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            SocksAddr::Ipv4(b) => write!(w, "{}.{}.{}.{}", b[0], b[1], b[2], b[3]),
-            SocksAddr::Domain(b) => write!(w, "{:?}", b.as_bstr()),
-            SocksAddr::Ipv6(b) => write!(w, "[{:02X?}{:02X?}:{:02X?}{:02X?}:{:02X?}{:02X?}:{:02X?}{:02X?}:{:02X?}{:02X?}:{:02X?}{:02X?}:{:02X?}{:02X?}:{:02X?}{:02X?}]",
-                b[0], b[1], b[2], b[3],
-                b[4], b[5], b[6], b[7],
-                b[8], b[9], b[10], b[11],
-                b[12], b[13], b[14], b[15],
-            ),
+pub async fn serve_socks(mut stream: TcpStream, state: Arc<State>) -> Result<()> {
+    let timeout = Duration::from_secs(state.config.routing.handshake_timeout_seconds);
+    let handshake = tokio::time::timeout(timeout, handshake(&mut stream, &state))
+        .await
+        .context("client SOCKS5 handshake timed out")??;
+    let (identity, target) = handshake;
+    match state.tunnel(&identity, &target).await {
+        Ok((upstream, reservation)) => {
+            stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+            relay(stream, upstream, reservation).await
+        }
+        Err(error) => {
+            let code = match error.downcast_ref::<ConnectError>() {
+                Some(ConnectError::Target(code @ 1..=8)) => *code as u8,
+                Some(ConnectError::Target(_)) => 2,
+                _ => 1,
+            };
+            reply_error(&mut stream, code).await?;
+            Err(error)
         }
     }
 }
 
-pub async fn recv_handshake<'a>(
-    socket: &mut TcpStream,
-    addr_buf: &'a mut [u8],
-) -> Result<(SocksAddr<'a>, u16)> {
-    let mut buf = [0u8; 2];
-    socket
-        .read_exact(&mut buf)
-        .await
-        .context("Failed to read handshake")?;
-
-    if buf[0] != 5 {
-        bail!("Unexpected socks version");
+async fn handshake(stream: &mut TcpStream, state: &State) -> Result<(Identity, Target)> {
+    let version = stream.read_u8().await?;
+    let count = stream.read_u8().await? as usize;
+    if version != 5 || count == 0 {
+        bail!("invalid SOCKS5 greeting");
     }
-
-    let n = buf[1] as usize;
-
-    if n == 0 {
-        bail!("Got empty list of supported authentication methods");
+    let mut methods = vec![0; count];
+    stream.read_exact(&mut methods).await?;
+    let method = if state.auth.required() {
+        if methods.contains(&2) {
+            2
+        } else {
+            255
+        }
+    } else if methods.contains(&0) {
+        0
+    } else {
+        255
+    };
+    stream.write_all(&[5, method]).await?;
+    if method == 255 {
+        bail!("no acceptable SOCKS5 authentication method");
     }
-
-    let mut buf = [0u8; 255];
-    socket
-        .read_exact(&mut buf[..n])
-        .await
-        .context("Failed to read handshake")?;
-
-    // TODO: we're going to ignore the list and expect the client to support no-auth
-
-    socket
-        .write_all(&[0x05, 0x00])
-        .await
-        .context("Failed to send handshake")?;
-
-    let mut buf = [0u8; 4];
-    socket
-        .read_exact(&mut buf)
-        .await
-        .context("Failed to read handshake")?;
-
-    if buf[0] != 5 {
-        bail!("Unexpected socks version");
+    let identity = if method == 2 {
+        let version = stream.read_u8().await?;
+        let username = read_string(stream).await?;
+        let password = read_string(stream).await?;
+        let verified = if version == 1 && !username.is_empty() && !password.is_empty() {
+            state.authenticate(Some((&username, &password))).await
+        } else {
+            Err(anyhow::anyhow!("invalid SOCKS5 credentials"))
+        };
+        stream
+            .write_all(&[1, if verified.is_ok() { 0 } else { 1 }])
+            .await?;
+        verified?
+    } else {
+        state.authenticate(None).await?
+    };
+    let mut command = [0; 4];
+    stream.read_exact(&mut command).await?;
+    if command[0] != 5 || command[2] != 0 {
+        reply_error(stream, 1).await?;
+        bail!("invalid SOCKS5 request");
     }
-
-    if buf[1] != 1 {
-        bail!("Only tcp/ip stream connections are supported");
-    }
-
-    if buf[2] != 0 {
-        bail!("Reserved field is not zero");
-    }
-
-    let addr = match buf[3] {
+    let host = match command[3] {
         1 => {
-            let buf = &mut addr_buf[..4];
-            socket
-                .read_exact(buf)
-                .await
-                .context("Failed to read handshake")?;
-            SocksAddr::Ipv4(buf)
-        }
-        3 => {
-            let n = socket.read_u8().await.context("Failed to read handshake")? as usize;
-            let buf = &mut addr_buf[..n];
-            socket
-                .read_exact(buf)
-                .await
-                .context("Failed to read handshake")?;
-            SocksAddr::Domain(buf)
+            let mut bytes = [0; 4];
+            stream.read_exact(&mut bytes).await?;
+            Ipv4Addr::from(bytes).to_string()
         }
         4 => {
-            let buf = &mut addr_buf[..16];
-            socket
-                .read_exact(buf)
-                .await
-                .context("Failed to read handshake")?;
-            SocksAddr::Ipv6(buf)
+            let mut bytes = [0; 16];
+            stream.read_exact(&mut bytes).await?;
+            Ipv6Addr::from(bytes).to_string()
         }
-        x => {
-            bail!("Unsupported address type: {}", x);
+        3 => read_string(stream).await?,
+        _ => {
+            reply_error(stream, 8).await?;
+            bail!("unsupported SOCKS5 address type");
         }
     };
-
-    let port = socket
-        .read_u16()
-        .await
-        .context("Failed to read handshake")?;
-
-    Ok((addr, port))
+    let port = stream.read_u16().await?;
+    if command[1] != 1 {
+        reply_error(stream, 7).await?;
+        bail!("only SOCKS5 TCP CONNECT is supported");
+    }
+    let target = match Target::new(&host, port) {
+        Ok(target) => target,
+        Err(error) => {
+            reply_error(stream, 8).await?;
+            return Err(error);
+        }
+    };
+    Ok((identity, target))
 }
 
-async fn connect(proxy_addr: &SocketAddr, addr: &SocksAddr<'_>, port: u16) -> Result<TcpStream> {
-    debug!("Connecting to proxy server at {}", proxy_addr);
-    let mut proxy = TcpStream::connect(proxy_addr)
-        .await
-        .context("Failed to connect to proxy server")?;
-    debug!("Connected to {:?}", proxy_addr);
-
-    proxy
-        .write_all(&[5, 1, 0])
-        .await
-        .context("Failed to send handshake")?;
-
-    let mut buf = [0u8; 2];
-    proxy
-        .read_exact(&mut buf)
-        .await
-        .context("Failed to read handshake")?;
-
-    if buf != [5, 0] {
-        bail!("Proxy didn't accept anonymous auth");
-    }
-
-    let mut buf = vec![5, 1, 0];
-
-    match addr {
-        SocksAddr::Ipv4(b) => {
-            buf.push(1);
-            buf.extend(*b);
-        }
-        SocksAddr::Domain(b) => {
-            buf.push(3);
-            buf.push(b.len() as u8);
-            buf.extend(*b);
-        }
-        SocksAddr::Ipv6(b) => {
-            buf.push(4);
-            buf.extend(*b);
-        }
-    }
-
-    buf.extend(&port.to_be_bytes());
-
-    proxy
-        .write_all(&buf)
-        .await
-        .context("Failed to send handshake")?;
-
-    Ok(proxy)
+async fn read_string(stream: &mut TcpStream) -> Result<String> {
+    let length = stream.read_u8().await? as usize;
+    let mut data = vec![0; length];
+    stream.read_exact(&mut data).await?;
+    String::from_utf8(data).context("SOCKS5 string must be UTF-8")
 }
 
-pub async fn serve(mut socket: TcpStream, pool:&Pool<RedisConnectionManager>,redis_key:&String) -> Result<()> {
-    let mut buf = [0u8; 255];
-    let (addr, port) = recv_handshake(&mut socket, &mut buf)
-        .await
-        .context("Failed to complete handshake with client")?;
-
-    debug!("Received connection request for {}:{}", addr, port);
-    let proxies = get_proxies(pool,redis_key,"socks5").await?;
-    let proxy = proxies
-        .choose(&mut rand::thread_rng())
-        .context("No proxies configured")?;
-    debug!("Picked random proxy: {}", proxy);
-
-    let mut proxy = connect(&proxy, &addr, port)
-        .await
-        .context("Failed to complete handshake with proxy")?;
-
-    tokio::io::copy_bidirectional(&mut socket, &mut proxy)
-        .await
-        .context("Failed to relay data")?;
-
-    debug!("Connection finished");
-
+async fn reply_error(stream: &mut TcpStream, code: u8) -> Result<()> {
+    stream.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
     Ok(())
 }

@@ -1,98 +1,89 @@
-// https://github.com/rust-lang/rust-clippy/issues/7271
-#![allow(clippy::needless_lifetimes)]
-
-extern crate anyhow;
-
-pub mod args;
-pub mod errors;
-pub mod list;
-pub mod socks5;
-pub mod http;
-mod redis_util;
-
-use crate::args::Args;
-use crate::errors::*;
-use env_logger::Env;
-use structopt::StructOpt;
-use tokio::net::TcpListener;
-// use tokio::signal::unix::{signal, SignalKind};
-use anyhow::Result;
-use mobc::Pool;
-use mobc_redis::{redis, RedisConnectionManager};
+use anyhow::{bail, Context, Result};
+use clap::Parser;
+use rproxy::{
+    args::{Args, Command},
+    auth::Authenticator,
+    http::tls_acceptor,
+    routing::Router,
+    server::{Server, State},
+    store::Store,
+    upstream::verify_pool,
+};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::from_args();
-
-    let logging = match (args.quiet, args.verbose) {
-        (true, _) => "warn",
-        (false, 0) => "info",
-        (false, 1) => "info,laundry5=debug",
-        (false, 2) => "debug",
-        (false, _) => "debug,laundry5=trace",
+    let args = Args::parse();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(if args.quiet {
+        "warn"
+    } else if args.verbose > 0 {
+        "debug"
+    } else {
+        "info"
+    }))
+    .init();
+    let config = args.load_config()?;
+    if matches!(args.command, Some(Command::CheckConfig)) {
+        if let Some(tls) = &config.tls {
+            tls_acceptor(tls)?;
+        }
+        println!("Configuration valid");
+        return Ok(());
+    }
+    let auth = Authenticator::new(&config);
+    let release_identity = if let Some(Command::ReleaseSession {
+        username,
+        password_env,
+    }) = &args.command
+    {
+        if !auth.required() {
+            bail!("release-session requires configured authentication");
+        }
+        let password = std::env::var(password_env)
+            .context("release credential environment variable is missing")?;
+        Some(
+            auth.verify(username, &password)
+                .context("release authentication failed")?,
+        )
+    } else {
+        None
     };
-    env_logger::init_from_env(Env::default().default_filter_or(logging));
-
-    // a stream of sighup signals
-    // let mut sighup = signal(SignalKind::hangup())?;
-    info!("Binding socks5 listener to {}", args.socks5_bind);
-    let socks5_listener = TcpListener::bind(args.socks5_bind).await?;
-    info!("Binding http listener to {}", args.http_bind);
-    let http_listener = TcpListener::bind(args.http_bind).await?;
-
-
-    let client = redis::Client::open(args.redis_url).unwrap();
-    let manager = RedisConnectionManager::new(client);
-    let pool = Pool::builder().max_open(10).build(manager);
-    let redis_key = args.redis_key;
-
-    loop {
-        tokio::select! {
-            s5_res = socks5_listener.accept() => {
-                let (socket, src) = match s5_res {
-                    Ok(x) => x,
-                    Err(err) => {
-                        error!("Failed to accept connection: {:#}", err);
-                        continue;
-                    },
-                };
-                debug!("Got new client connection from {}", src);
-                let pool = pool.clone();
-                let key = redis_key.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = socks5::serve(socket, &pool,&key).await {
-                        warn!("Error serving client: {:#}", err);
-                    }
-                });
+    let store = Store::connect(&config).await?;
+    match args.command.unwrap_or(Command::Serve) {
+        Command::CheckConfig => unreachable!(),
+        Command::VerifyPool => {
+            let count = verify_pool(&config, &store).await?;
+            println!("Verified {count} stable upstreams");
+        }
+        Command::ReleaseSession { .. } => {
+            let identity = release_identity.unwrap();
+            store
+                .authenticate(&identity, config.auth.ttl_seconds)
+                .await?;
+            Router::new(config, store)
+                .release_session(&identity)
+                .await?;
+            println!("Session released or draining");
+        }
+        Command::Serve => {
+            if !auth.required() {
+                log::warn!("anonymous proxy mode enabled; do not expose to untrusted networks");
             }
-            http_res = http_listener.accept()=>{
-                let(socket,src) = match http_res{
-                    Ok(x)=>x,
-                    Err(err)=>{
-                        error!("failed to accept http connection: {:#}",err);
-                        continue;
-                    },
-                };
-                debug!("Got connection from {}",src);
-                 let pool = pool.clone();
-                 let key = redis_key.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = http::serve(socket,&pool,&key).await{
-                        warn!("Error serving client: {:#}", err);
-                    }
-                });
+            if config.probe.insecure {
+                log::warn!("certificate verification disabled ONLY for egress probes");
             }
-            // _ = sighup.recv() => {
-            //     debug!("Got signal HUP");
-            //     match redis_util::get_random_proxy(&pool,redis_key).await {
-            //         Ok(x) => {
-            //
-            //         }
-            //         Err(err) => {
-            //             error!("Failed to reload proxy list: {:#}", err);
-            //         }
-            //     }
-            // }
+            let state = Arc::new(State {
+                auth,
+                router: Router::new(config.clone(), store),
+                config,
+            });
+            Server::bind(state)
+                .await?
+                .run(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await?;
         }
     }
+    Ok(())
 }
