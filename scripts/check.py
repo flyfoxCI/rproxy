@@ -1,110 +1,77 @@
-import json
+import argparse
+import asyncio
 import logging
-import optparse
-import re
-import sys
 import time
-from datetime import datetime
-import redis
+
 import schedule
 
 from async_http import check_http
-from aio_pool import AioPool
-
 from async_sock5 import check_socks
-from conf import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_KEY, LOG_LEVEL, LOG_FORMAT
+from conf import REDIS_KEY, LOG_LEVEL, LOG_FORMAT
+from maintenance import check_many, connection, record, safe_run
 
 
-class BaseCheck(object):
-    HTTP_HOST = "www.baidu.com"
-    HTTP_PATTERN = re.compile("^HTTP\/1\.\d ([0-9]{3}) .*")
-
+class BaseCheck:
     def __init__(self, payload_proto, concurrency):
+        if concurrency < 1:
+            raise ValueError("concurrency must be positive")
         self.payload_proto = payload_proto
         self.concurrency = concurrency
-        self.conn = self.createConn()
+        self.conn = connection()
         self.redis_key = REDIS_KEY + ":" + payload_proto
-        self.pool = AioPool(processes=4, concurrency_limit=self.concurrency)
 
-    def createConn(self):
-        conn = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD)
-        return conn
+    def getProxyList(self, redis_key):
+        return self.conn.hgetall(redis_key)
 
     def run(self):
-        proxy_list = self.getProxyList(self.redis_key)
-        proxy_list = [p.decode() for p in proxy_list]
-        results = self.pool.map(self.check, [p for p in proxy_list])
-        to_delete = []
-        to_update = {}
-        for r in results:
-            flag, proxy = r
-            if flag:
-                to_update[proxy] = json.dumps({'private_ip': proxy,
-                                               'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
-            else:
-                to_delete.append(proxy)
-        if len(to_delete) > 0:
-            self.conn.hdel(self.redis_key, *to_delete)
-        if len(to_update.keys()) > 0:
-            self.conn.hmset(self.redis_key, mapping=to_update)
+        snapshot = self.getProxyList(self.redis_key)
+        proxies = [proxy.decode() for proxy in snapshot]
+        results = asyncio.run(check_many(self.check, proxies, self.concurrency))
+        script = """
+            if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+            if ARGV[3] == 'delete' then return redis.call('HDEL', KEYS[1], ARGV[1]) end
+            redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+            return 1
+        """
+        with self.conn.pipeline(transaction=False) as pipeline:
+            for healthy, proxy in results:
+                pipeline.eval(script, 1, self.redis_key, proxy, snapshot[proxy.encode()],
+                              record(proxy) if healthy else "delete")
+            pipeline.execute()
 
 
 class HTTPProxyCheck(BaseCheck):
-
     def __init__(self, concurrency):
-        BaseCheck.__init__(self, "http", concurrency)
-
-    @staticmethod
-    async def check(proxy):
-        return await check_http(proxy)
-
-    def getProxyList(self, redis_key):
-        return self.conn.hgetall(redis_key)
+        super().__init__("http", concurrency)
+    check = staticmethod(check_http)
 
 
 class Socsk5ProxyCheck(BaseCheck):
-
     def __init__(self, concurrency):
-        BaseCheck.__init__(self, "socks5", concurrency)
-
-    @staticmethod
-    async def check(proxy):
-        return await check_socks(proxy)
-
-    def getProxyList(self, redis_key):
-        return self.conn.hgetall(redis_key)
+        super().__init__("socks5", concurrency)
+    check = staticmethod(check_socks)
 
 
-def usage():
-    return "Usage: %s <http|http_tunnel|socks5> [options]" % (sys.argv[0])
-
-
-if __name__ == '__main__':
-    parser = optparse.OptionParser(usage=usage())
-    parser.add_option("-c", "--concurrency", action="store", dest="concurrency", type="int",
-                      default=60)
-    parser.add_option("-e", "--every", action="store", dest="every", type="int", default=1,
-                      help="run check every %default minutes")
-    options, args = parser.parse_args()
-
+def main():
+    parser = argparse.ArgumentParser(description="Check and prune upstream proxies")
+    parser.add_argument("protocol", choices=["http", "socks5"])
+    parser.add_argument("-c", "--concurrency", type=int, default=60)
+    parser.add_argument("-e", "--every", type=int, default=60, help="interval in seconds")
+    args = parser.parse_args()
+    if min(args.every, args.concurrency) < 1:
+        parser.error("interval and concurrency must be positive")
     logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
+    cls = HTTPProxyCheck if args.protocol == "http" else Socsk5ProxyCheck
+    checker = cls(args.concurrency)
+    schedule.every(args.every).seconds.do(safe_run, checker)
+    safe_run(checker)
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
+    finally:
+        checker.conn.close()
 
-    # if len(sys.argv) < 2:
-    #     print(usage())
-    #     sys.exit(1)
 
-    proto = args[0]
-    checker = None
-    if proto == "http":
-        checker = HTTPProxyCheck(options.concurrency)
-    elif proto == "socks5":
-        checker = Socsk5ProxyCheck(options.concurrency)
-    else:
-        logging.error("proto not support")
-        sys.exit(-1)
-    schedule.every(options.every).minutes.do(checker.run).run()
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-    # checker = HTTPProxyCheck(10)
-    # checker.run()
+if __name__ == "__main__":
+    main()
