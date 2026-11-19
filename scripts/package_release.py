@@ -7,7 +7,13 @@ import tarfile
 import tomllib
 import zipfile
 
-TARGETS = {'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-musl'}
+TARGETS = {
+    'x86_64-pc-windows-msvc',
+    'x86_64-unknown-linux-musl',
+    'aarch64-unknown-linux-musl',
+    'x86_64-apple-darwin',
+    'aarch64-apple-darwin',
+}
 
 
 def build_archive(root, target, tag, output):
@@ -47,6 +53,23 @@ def build_archive(root, target, tag, output):
     return archive
 
 
+def verify_archives(directory, tag):
+    if not re.fullmatch(r'v\d+\.\d+\.\d+', tag):
+        raise ValueError('invalid release tag')
+    expected = {f'rproxy-{tag}-{target}' + ('.zip' if 'windows' in target else '.tar.gz')
+                for target in TARGETS}
+    if not directory.is_dir():
+        raise ValueError('release directory is missing')
+    actual = {path.name for path in directory.iterdir() if path.name != 'SHA256SUMS'}
+    if actual != expected:
+        raise ValueError(f'incomplete or unexpected release archives: missing={sorted(expected - actual)}, '
+                         f'unexpected={sorted(actual - expected)}')
+    archives = [directory / name for name in sorted(expected)]
+    if any(not path.is_file() or path.is_symlink() or path.stat().st_size == 0 for path in archives):
+        raise ValueError('release archives must be nonempty regular files')
+    return archives
+
+
 def write_checksums(directory):
     archives = sorted(path for path in directory.iterdir()
                       if path.name.endswith(('.zip', '.tar.gz')) and path.is_file())
@@ -68,11 +91,17 @@ if __name__ == '__main__':
     package.add_argument('--target', choices=sorted(TARGETS), required=True)
     package.add_argument('--tag', required=True)
     package.add_argument('--output', type=pathlib.Path, default=pathlib.Path('dist'))
+    verify = subparsers.add_parser('verify')
+    verify.add_argument('--tag', required=True)
+    verify.add_argument('--directory', type=pathlib.Path, default=pathlib.Path('dist'))
     checksums = subparsers.add_parser('checksums')
     checksums.add_argument('--directory', type=pathlib.Path, default=pathlib.Path('dist'))
     args = parser.parse_args()
     if args.command == 'package':
         root = pathlib.Path(__file__).resolve().parents[1]
         print(build_archive(root, args.target, args.tag, args.output))
+    elif args.command == 'verify':
+        for archive in verify_archives(args.directory, args.tag):
+            print(archive)
     else:
         print(write_checksums(args.directory))
