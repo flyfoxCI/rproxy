@@ -36,10 +36,21 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             executable: rproxy
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            executable: rproxy
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: rproxy
+          - os: macos-15
+            target: aarch64-apple-darwin
+            executable: rproxy
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             executable: rproxy.exe
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,6 +63,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
+      - name: Select native musl C compiler and linker
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          target_env="${TARGET//-/_}"
+          printf 'CC_%s=musl-gcc\n' "$target_env" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_%s_LINKER=musl-gcc\n' "${target_env^^}" >> "$GITHUB_ENV"
       - name: Prepare Rust target
         shell: bash
         env:
@@ -66,6 +86,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           EXECUTABLE: ${{ matrix.executable }}
         run: |
+          python -c "import os, platform; host = platform.machine().lower(); host = {'amd64': 'x86_64', 'arm64': 'aarch64'}.get(host, host); expected = os.environ['TARGET'].split('-')[0]; assert host == expected, f'Runner architecture {host} does not match target {expected}'; print(f'Native runner architecture: {host}')"
           cargo build --release --locked --target "$TARGET"
           "target/$TARGET/release/$EXECUTABLE" --version
           "target/$TARGET/release/$EXECUTABLE" --config rproxy.example.toml check-config
@@ -100,8 +121,7 @@ jobs:
           path: dist
       - name: Verify artifacts and calculate SHA-256
         run: |
-          test "$(find dist -maxdepth 1 -name '*.zip' | wc -l)" -eq 1
-          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
+          python scripts/package_release.py verify --tag "$RELEASE_TAG" --directory dist
           python scripts/package_release.py checksums --directory dist
           cd dist
           sha256sum --check SHA256SUMS

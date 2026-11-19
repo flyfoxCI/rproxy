@@ -19,9 +19,15 @@
 
 从 [GitHub Releases](https://github.com/flyfoxCI/rproxy/releases) 下载：
 
-- Linux x64：`rproxy-v0.2.0-x86_64-unknown-linux-musl.tar.gz`（静态链接，无需另装 OpenSSL）。
-- Windows x64：`rproxy-v0.2.0-x86_64-pc-windows-msvc.zip`。
-- 使用同一 Release 的 `SHA256SUMS` 检查下载完整性。
+| 系统 | 架构 | 发布包 |
+|---|---|---|
+| Linux | x86_64 / AMD64 | `rproxy-v0.2.1-x86_64-unknown-linux-musl.tar.gz` |
+| Linux | ARM64 / AArch64 | `rproxy-v0.2.1-aarch64-unknown-linux-musl.tar.gz` |
+| macOS | Intel x86_64 | `rproxy-v0.2.1-x86_64-apple-darwin.tar.gz` |
+| macOS | Apple Silicon ARM64 | `rproxy-v0.2.1-aarch64-apple-darwin.tar.gz` |
+| Windows | x86_64 | `rproxy-v0.2.1-x86_64-pc-windows-msvc.zip` |
+
+Linux 包静态链接 musl，无需另装 OpenSSL；macOS 构建目标为 11.0+，分别在 Intel 和 Apple Silicon 原生 runner 上执行启动检查，不是把同一个二进制重命名。使用同一 Release 的 `SHA256SUMS` 检查下载完整性。macOS 包目前未做 Apple Developer 签名/公证，首次执行可能需要按系统安全策略确认。
 
 解压后复制示例配置并修改密码，再运行包内 `rproxy` / `rproxy.exe`。包内包含 Python 维护脚本，其依赖仍需按下文安装。
 

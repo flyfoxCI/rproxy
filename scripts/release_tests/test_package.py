@@ -7,6 +7,7 @@ import unittest
 import zipfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+import package_release
 from package_release import build_archive, write_checksums
 
 
@@ -53,6 +54,40 @@ class ReleasePackagingTests(unittest.TestCase):
         checksums = write_checksums(self.root / 'dist')
         expected = hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + archive.name + '\n'
         self.assertEqual(checksums.read_text(), expected)
+
+    def test_linux_and_macos_packages_cover_arm64_and_x86_64(self):
+        for target in ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl',
+                       'x86_64-apple-darwin', 'aarch64-apple-darwin']:
+            with self.subTest(target=target):
+                self.executable(target)
+                archive = build_archive(self.root, target, 'v0.2.0', self.root / 'dist')
+                self.assertEqual(archive.name, f'rproxy-v0.2.0-{target}.tar.gz')
+                with tarfile.open(archive, 'r:gz') as bundle:
+                    member = bundle.getmember(f'rproxy-v0.2.0-{target}/rproxy')
+                    self.assertEqual(member.mode & 0o777, 0o755)
+                    self.assertEqual(bundle.extractfile(member).read(), b'test executable')
+
+    def test_publication_requires_all_five_platform_archives_without_extras(self):
+        targets = ['x86_64-pc-windows-msvc', 'x86_64-unknown-linux-musl',
+                   'aarch64-unknown-linux-musl', 'x86_64-apple-darwin', 'aarch64-apple-darwin']
+        output = self.root / 'dist'
+        for index, target in enumerate(targets):
+            self.executable(target)
+            build_archive(self.root, target, 'v0.2.0', output)
+            if index < 4:
+                with self.assertRaises(ValueError):
+                    package_release.verify_archives(output, 'v0.2.0')
+        names = {path.name for path in package_release.verify_archives(output, 'v0.2.0')}
+        self.assertEqual(names, {
+            'rproxy-v0.2.0-x86_64-pc-windows-msvc.zip',
+            'rproxy-v0.2.0-x86_64-unknown-linux-musl.tar.gz',
+            'rproxy-v0.2.0-aarch64-unknown-linux-musl.tar.gz',
+            'rproxy-v0.2.0-x86_64-apple-darwin.tar.gz',
+            'rproxy-v0.2.0-aarch64-apple-darwin.tar.gz',
+        })
+        (output / 'rproxy-v0.1.0-x86_64-apple-darwin.tar.gz').write_bytes(b'unexpected old archive')
+        with self.assertRaises(ValueError):
+            package_release.verify_archives(output, 'v0.2.0')
 
     def test_mismatched_or_invalid_tag_is_rejected(self):
         for tag in ['v0.3.0', '../v0.2.0', 'v0.2.0;bad']:
