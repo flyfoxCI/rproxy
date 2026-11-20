@@ -86,7 +86,16 @@ where
     let connection = builder
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades();
-    connection.await.context("HTTP client connection failed")
+    tokio::pin!(connection);
+    let mut revocations = state.router.store.subscribe_revocations();
+    loop {
+        tokio::select! {
+            result = &mut connection => return result.context("HTTP client connection failed"),
+            _ = revocations.changed() => {
+                if let Some(reservation) = route.reservation.lock().await.clone() { reservation.renew().await?; }
+            }
+        }
+    }
 }
 
 fn error_response(status: StatusCode, message: &'static str) -> Response<Body> {
@@ -133,10 +142,23 @@ async fn handle(
     state: Arc<State>,
     route: Arc<ConnectionRoute>,
 ) -> Response<Body> {
-    let identity = match credentials(request.headers()).and_then(|credentials| match credentials {
-        Some((username, password)) => state.auth.verify(&username, &password),
-        None => state.auth.anonymous(),
-    }) {
+    let parsed = match credentials(request.headers()) {
+        Ok(credentials) => credentials,
+        Err(_) => {
+            return error_response(
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                "Proxy authentication required",
+            )
+        }
+    };
+    let identity = match state
+        .authenticate(
+            parsed
+                .as_ref()
+                .map(|(user, password)| (user.as_str(), password.as_str())),
+        )
+        .await
+    {
         Ok(identity) => identity,
         Err(_) => {
             return error_response(
@@ -145,22 +167,12 @@ async fn handle(
             )
         }
     };
-    if state.auth.required()
-        && state
-            .router
-            .store
-            .authenticate(&identity, state.config.auth.ttl_seconds)
-            .await
-            .is_err()
-    {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Authentication backend unavailable",
-        );
-    }
     {
         let mut current = route.identity.lock().await;
-        if current.as_ref().is_some_and(|old| old != &identity) {
+        if current
+            .as_ref()
+            .is_some_and(|old| !old.same_route(&identity))
+        {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "Route identity cannot change on a reused connection",

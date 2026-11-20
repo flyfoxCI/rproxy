@@ -2,7 +2,7 @@ FROM docker.io/library/rust:1-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked --jobs 2
+RUN cargo build --release --locked --jobs 1
 
 FROM docker.io/library/debian:bookworm-slim AS rproxy
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --uid 10001 --gid 10001 --no-create-home rproxy \
     && mkdir -p /var/lib/rproxy \
     && chown 10001:10001 /var/lib/rproxy
-COPY --from=build /build/target/release/rproxy /usr/local/bin/rproxy
+COPY --from=build /build/target/release/rproxy /build/target/release/rproxy-cli /usr/local/bin/
 USER 10001:10001
 WORKDIR /var/lib/rproxy
 EXPOSE 9099 9089 9443

@@ -19,6 +19,7 @@ async fn fixture() -> (Config, Store) {
     config.probe.enabled = false;
     config.database = ":memory:".into();
     config.admin.enabled = false;
+    config.auth.mode = rproxy::config::AuthMode::Anonymous;
     let store = Store::open(&config).await.unwrap();
     (config, store)
 }

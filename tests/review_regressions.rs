@@ -33,6 +33,10 @@ fn proxy(port: u16, ip: &str) -> Proxy {
 async fn fixture() -> (Config, Store) {
     let config = Config {
         database: ":memory:".into(),
+        auth: rproxy::config::AuthConfig {
+            mode: rproxy::config::AuthMode::Anonymous,
+            ..Default::default()
+        },
         ..Config::default()
     };
     let store = Store::open(&config).await.unwrap();

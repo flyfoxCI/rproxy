@@ -11,5 +11,9 @@
 /scripts/providers.env
 /certs/
 *.pem
+*.key
+/sources.toml
+/private-sources.*
+/sources-private.*
 __pycache__/
 *.pyc

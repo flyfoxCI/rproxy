@@ -43,7 +43,8 @@ fn wrong_password_unknown_strategy_and_unauthorized_business_are_rejected() {
 
 #[test]
 fn anonymous_requires_explicit_unauthenticated_configuration() {
-    let config = Config::parse("").unwrap();
+    assert!(Authenticator::new(&Config::default()).anonymous().is_err());
+    let config = Config::parse("[auth]\nmode='anonymous'").unwrap();
     let id = Authenticator::new(&config).anonymous().unwrap();
     assert_eq!(id.strategy, Strategy::Random);
     assert_eq!(id.business, "default");

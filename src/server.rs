@@ -21,7 +21,11 @@ pub struct State {
 impl State {
     pub async fn authenticate(&self, credentials: Option<(&str, &str)>) -> Result<Identity> {
         let identity = match credentials {
-            Some((username, password)) => self.auth.verify(username, password)?,
+            Some((username, password)) => {
+                self.auth
+                    .verify_live(&self.router.store, username, password)
+                    .await?
+            }
             None => self.auth.anonymous()?,
         };
         if self.auth.required() {
@@ -82,6 +86,7 @@ pub struct Server {
     tls: Option<tokio_rustls::TlsAcceptor>,
     admin: Option<TcpListener>,
     admin_token: Option<Arc<String>>,
+    worker_token: Option<Arc<String>>,
 }
 
 impl Server {
@@ -105,8 +110,10 @@ impl Server {
         if http.is_none() && https.is_none() && socks.is_none() {
             bail!("no listeners enabled");
         }
+        let mut worker_token = None;
         let (admin, admin_token) = if state.config.admin.enabled {
             let token = crate::admin::token(&state.config)?;
+            worker_token = crate::admin::worker_token(&state.config, &token)?.map(Arc::new);
             (
                 Some(TcpListener::bind(state.config.admin.bind).await?),
                 Some(Arc::new(token)),
@@ -122,6 +129,7 @@ impl Server {
             tls,
             admin,
             admin_token,
+            worker_token,
         })
     }
     pub fn admin_address(&self) -> Option<std::net::SocketAddr> {
@@ -220,12 +228,18 @@ impl Server {
             let state = self.state.clone();
             let tls = self.tls.clone();
             let admin_token = self.admin_token.clone();
+            let worker_token = self.worker_token.clone();
             tasks.spawn(async move {
                 let _permit = permit;
                 let result = match protocol {
                     "admin" => match tokio::time::timeout(
                         Duration::from_secs(20),
-                        crate::admin::serve(stream, state, admin_token.unwrap()),
+                        crate::admin::serve_scoped(
+                            stream,
+                            state,
+                            admin_token.unwrap(),
+                            worker_token,
+                        ),
                     )
                     .await
                     {

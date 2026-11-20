@@ -11,8 +11,10 @@ services:
       - no-new-privileges:true
     stop_grace_period: 30s
     environment:
-      RPROXY_PASSWORD: ${RPROXY_PASSWORD:?Set RPROXY_PASSWORD in .env}
+      # Used only for one-time bootstrap; existing managed users are never overwritten.
+      RPROXY_PASSWORD: ${RPROXY_PASSWORD:-}
       RPROXY_ADMIN_TOKEN: ${RPROXY_ADMIN_TOKEN:?Set RPROXY_ADMIN_TOKEN in .env}
+      RPROXY_WORKER_TOKEN: ${RPROXY_WORKER_TOKEN:?Set RPROXY_WORKER_TOKEN in .env}
     # Container listeners must not use the native example's loopback addresses.
     command:
       - --config
@@ -61,7 +63,7 @@ services:
       rproxy:
         condition: service_healthy
     environment:
-      RPROXY_ADMIN_TOKEN: ${RPROXY_ADMIN_TOKEN:?Set RPROXY_ADMIN_TOKEN in .env}
+      RPROXY_WORKER_TOKEN: ${RPROXY_WORKER_TOKEN:?Set RPROXY_WORKER_TOKEN in .env}
     env_file:
       - ${RPROXY_PROVIDERS_ENV:-./scripts/providers.env}
     volumes:

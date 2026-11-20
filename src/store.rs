@@ -47,6 +47,8 @@ mod tests {
     }
 }
 
+mod managed;
+
 type Job = Box<dyn FnOnce(&mut Database) + Send>;
 struct Worker {
     sender: Option<mpsc::Sender<Job>>,
@@ -68,6 +70,7 @@ impl Drop for Worker {
 pub struct Store {
     worker: Arc<Worker>,
     changes: Arc<watch::Sender<u64>>,
+    revocations: Arc<watch::Sender<u64>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Candidate {
@@ -93,6 +96,7 @@ struct Database {
     auth: HashMap<String, (u64, Instant)>,
     capacity: usize,
     max_age: u64,
+    managed: managed::Managed,
 }
 impl Database {
     fn open(config: &Config) -> Result<Self> {
@@ -134,18 +138,17 @@ impl Database {
                 .context("database is already owned by another rproxy process")?;
             Some(Arc::new(file))
         };
-        let connection =
+        let mut connection =
             Connection::open(&config.database).context("cannot open SQLite database")?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 1 {
+        if version > 2 {
             bail!("unsupported database schema version {version}");
         }
         connection.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS proxies (id TEXT PRIMARY KEY, record TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS businesses (name TEXT PRIMARY KEY, state TEXT NOT NULL);
-            PRAGMA user_version=1;",
+            CREATE TABLE IF NOT EXISTS businesses (name TEXT PRIMARY KEY, state TEXT NOT NULL);",
         )?;
         let mut records = BTreeMap::new();
         {
@@ -187,7 +190,9 @@ impl Database {
                 businesses.insert(name, business);
             }
         }
+        let managed = managed::Managed::load(&mut connection, config, &mut businesses, &records)?;
         Ok(Self {
+            managed,
             connection,
             _lock: lock,
             records,
@@ -243,6 +248,7 @@ impl Store {
             .await
             .context("state worker stopped during initialization")??;
         let (changes, _) = watch::channel(0);
+        let (revocations, _) = watch::channel(0);
         Ok(Self {
             worker: Arc::new(Worker {
                 sender: Some(sender),
@@ -251,6 +257,7 @@ impl Store {
                 _lock: lock,
             }),
             changes: Arc::new(changes),
+            revocations: Arc::new(revocations),
         })
     }
     async fn call<T: Send + 'static>(
@@ -275,6 +282,13 @@ impl Store {
     }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
+    }
+    pub fn subscribe_revocations(&self) -> watch::Receiver<u64> {
+        self.revocations.subscribe()
+    }
+    fn notify_revocations(&self) {
+        self.revocations
+            .send_modify(|value| *value = value.wrapping_add(1));
     }
     pub fn request_probe(&self) {
         self.changes
@@ -311,58 +325,18 @@ impl Store {
         addresses: Vec<SocketAddr>,
         source: String,
     ) -> Result<usize> {
-        if source.len() > 64 || source.is_empty() || addresses.len() > 256 {
-            bail!("invalid candidate batch");
-        }
-        if addresses
-            .iter()
-            .any(|a| a.port() == 0 || a.ip().is_unspecified())
-        {
-            bail!("invalid candidate address");
-        }
-        let added = self
-            .call(move |db| {
-                let mut entries = BTreeMap::new();
-                for address in addresses {
-                    let id = format!("{protocol}:{address}");
-                    if !db.records.contains_key(&id) {
-                        entries.insert(
-                            id,
-                            Candidate {
-                                protocol,
-                                address,
-                                source: source.clone(),
-                                generation: format!("{:032x}", rand::random::<u128>()),
-                                verified: None,
-                            },
-                        );
-                    }
-                }
-                if db.records.len().saturating_add(entries.len()) > db.capacity {
-                    bail!("proxy capacity reached");
-                }
-                let transaction = db.connection.transaction()?;
-                for (id, record) in &entries {
-                    transaction.execute(
-                        "INSERT INTO proxies(id,record) VALUES (?1,?2)",
-                        params![id, serde_json::to_string(record)?],
-                    )?;
-                }
-                transaction.commit()?;
-                let count = entries.len();
-                db.records.extend(entries);
-                Ok(count)
-            })
-            .await?;
-        if added > 0 {
-            self.changes
-                .send_modify(|value| *value = value.wrapping_add(1));
-        }
-        Ok(added)
+        self.import_manual(protocol, addresses, source).await
     }
     pub async fn candidates(&self) -> Result<Vec<Candidate>> {
-        self.call(|db| Ok(db.records.values().cloned().collect()))
-            .await
+        self.call(|db| {
+            Ok(db
+                .records
+                .iter()
+                .filter(|(id, _)| !db.managed.disabled.contains(*id))
+                .map(|(_, r)| r.clone())
+                .collect())
+        })
+        .await
     }
     pub async fn pool_addresses(&self) -> Result<Vec<(Protocol, SocketAddr)>> {
         Ok(self
@@ -406,9 +380,7 @@ impl Store {
             };
             let id = proxy.id.clone();
             if !proxy.stable {
-                db.connection
-                    .execute("DELETE FROM proxies WHERE id=?1", [&id])?;
-                db.records.remove(&id);
+                managed::retire(db, &id, "unstable-egress")?;
                 return Ok(true);
             }
             record.verified = Some(proxy);
@@ -428,9 +400,7 @@ impl Store {
                         .is_none_or(|p| !p.stable || p.verified_at.saturating_add(db.max_age) < now)
             });
             if removable {
-                db.connection
-                    .execute("DELETE FROM proxies WHERE id=?1", [&id])?;
-                db.records.remove(&id);
+                managed::retire(db, &id, "probe-failed")?;
             }
             Ok(removable)
         })
@@ -438,13 +408,8 @@ impl Store {
     }
     pub async fn remove_proxy(&self, id: &str) -> Result<()> {
         let id = id.to_owned();
-        self.call(move |db| {
-            db.connection
-                .execute("DELETE FROM proxies WHERE id=?1", [&id])?;
-            db.records.remove(&id);
-            Ok(())
-        })
-        .await
+        self.call(move |db| managed::retire(db, &id, "removed"))
+            .await
     }
     pub async fn metadata(&self) -> Result<Vec<Proxy>> {
         self.call(|db| {
@@ -472,6 +437,7 @@ impl Store {
     ) -> Result<(Proxy, bool)> {
         let identity = identity.clone();
         self.call(move |db| {
+            db.managed.validate_identity(&identity)?;
             let mut business = db
                 .businesses
                 .get(&identity.business)
@@ -479,8 +445,9 @@ impl Store {
                 .unwrap_or_default();
             let proxies: Vec<_> = db
                 .records
-                .values()
-                .filter_map(|r| r.verified.clone())
+                .iter()
+                .filter(|(id, _)| !db.managed.disabled.contains(*id))
+                .filter_map(|(_, r)| r.verified.clone())
                 .collect();
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             let result = business.reserve(
@@ -504,6 +471,7 @@ impl Store {
     }
     fn release_in(db: &mut Database, identity: &Identity, token: &str) -> Result<()> {
         // Occupancy is runtime-only: cleanup must still work if the disk becomes unwritable.
+        db.managed.revoked.remove(token);
         if let Some(business) = db.businesses.get_mut(&identity.business) {
             business.release(identity, token)?;
         }
@@ -525,6 +493,9 @@ impl Store {
         let identity = identity.clone();
         let token = token.to_owned();
         self.call(move |db| {
+            if db.managed.revoked.contains(&token) {
+                bail!("connection revoked by administrator");
+            }
             let session = db
                 .businesses
                 .get_mut(&identity.business)
