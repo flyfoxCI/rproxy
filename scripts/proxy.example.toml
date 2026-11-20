@@ -1,0 +1,73 @@
+# Copy to scripts/proxy.toml. Enable only suppliers you use.
+# Python 3.11+. Relative CA paths resolve from this file's directory.
+workers = 4
+
+[rproxy]
+# For native execution use http://127.0.0.1:9100 instead.
+url = "http://rproxy:9100"
+token_env = "RPROXY_ADMIN_TOKEN"
+timeout_seconds = 15
+
+# Generic plaintext extraction: one numeric IP:port per line (IPv6 uses brackets).
+[[providers]]
+name = "text-provider"
+enabled = false
+url = "${SUPPLIER_API_URL}"
+protocol = "http"
+method = "GET"
+interval_seconds = 60
+timeout_seconds = 10
+attempts = 3
+[providers.params]
+count = 10
+[providers.headers]
+Authorization = "Bearer ${SUPPLIER_API_TOKEN}"
+[providers.response]
+format = "text"
+
+# Mapping for the legacy Xdaili extraction response. Confirm your current API contract.
+[[providers]]
+name = "xdaili"
+enabled = false
+url = "${XDAILI_API_URL}"
+protocol = "http"
+[providers.response]
+format = "json"
+items_path = "RESULT"
+ip_path = "ip"
+port_path = "port"
+success_path = "ERRORCODE"
+success_value = "0"
+
+# Mapping for the legacy Shenlong extraction response. Confirm your current API contract.
+[[providers]]
+name = "shenlong"
+enabled = false
+url = "${SHENLONG_API_URL}"
+protocol = "socks5"
+[providers.response]
+format = "json"
+items_path = "data"
+ip_path = "ip"
+port_path = "port"
+success_path = "code"
+success_value = 200
+
+# A POST API returning {"data":{"proxies":[{"endpoint":"1.2.3.4:80"}]}}.
+[[providers]]
+name = "json-provider"
+enabled = false
+url = "${JSON_PROVIDER_API_URL}"
+method = "POST"
+protocol = "http"
+[providers.json]
+count = 10
+[providers.response]
+format = "json"
+items_path = "data.proxies"
+address_path = "endpoint"
+
+# Rola IP-whitelist extraction can use text/json mappings above if your account
+# provides such an API. Supply its documented URL/schema; no API path is assumed.
+# Credentialed rotating gateways and supplier sticky-session parameters are NOT
+# supported in this version. Ingress credentials are never forwarded upstream.

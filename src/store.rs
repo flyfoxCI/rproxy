@@ -1,154 +1,606 @@
 use anyhow::{bail, Context, Result};
-use redis::{aio::ConnectionManager, AsyncCommands};
-use serde_json::{json, Value};
-use std::time::Duration;
+use fs2::FileExt;
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs::{File, OpenOptions},
+    net::SocketAddr,
+    path::Path,
+    sync::{mpsc, Arc},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::{oneshot, watch, Semaphore};
 
 use crate::{
     auth::Identity,
     config::Config,
-    routing::{Protocol, Proxy},
+    pool_state::Business,
+    routing::{Capability, Protocol, Proxy},
 };
 
-#[derive(Clone)]
-pub struct Store {
-    connection: ConnectionManager,
-    prefix: String,
-    timeout: Duration,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_failure_does_not_release_process_ownership_while_handles_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            database: directory.path().join("state.sqlite3"),
+            ..Config::default()
+        };
+        let store = Store::open(&config).await.unwrap();
+        store
+            .worker
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Box::new(|_| panic!("simulated state worker failure")))
+            .unwrap();
+        assert!(store.status().await.is_err());
+        assert!(
+            Store::open(&config).await.is_err(),
+            "worker failure unlocked live process state"
+        );
+    }
 }
 
-impl Store {
-    pub async fn connect(config: &Config) -> Result<Self> {
-        let client = redis::Client::open(config.redis_url.as_str()).context("invalid Redis URL")?;
-        let timeout = Duration::from_secs(config.routing.renew_seconds);
-        let connection = tokio::time::timeout(timeout, client.get_connection_manager())
-            .await
-            .context("Redis connection timed out")?
-            .context("cannot connect to Redis")?;
+type Job = Box<dyn FnOnce(&mut Database) + Send>;
+struct Worker {
+    sender: Option<mpsc::Sender<Job>>,
+    thread: Option<thread::JoinHandle<()>>,
+    permits: Arc<Semaphore>,
+    _lock: Option<Arc<File>>,
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            if thread.thread().id() != thread::current().id() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+#[derive(Clone)]
+pub struct Store {
+    worker: Arc<Worker>,
+    changes: Arc<watch::Sender<u64>>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Candidate {
+    pub protocol: Protocol,
+    pub address: SocketAddr,
+    pub source: String,
+    pub generation: String,
+    pub verified: Option<Proxy>,
+}
+#[derive(Serialize)]
+pub struct Status {
+    pub candidates: usize,
+    pub verified: usize,
+    pub sessions: usize,
+    pub connections: usize,
+}
+struct Database {
+    connection: Connection,
+    _lock: Option<Arc<File>>,
+    records: BTreeMap<String, Candidate>,
+    businesses: BTreeMap<String, Business>,
+    cooldown: HashMap<String, Instant>,
+    auth: HashMap<String, (u64, Instant)>,
+    capacity: usize,
+    max_age: u64,
+}
+impl Database {
+    fn open(config: &Config) -> Result<Self> {
+        let memory = config.database == Path::new(":memory:");
+        let lock = if memory {
+            None
+        } else {
+            if let Some(parent) = config
+                .database
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).context("cannot create database directory")?;
+            }
+            // Unix flock is independent of SQLite's fcntl locks: lock the database inode,
+            // not a removable sidecar. Windows byte locks would block SQLite itself.
+            #[cfg(unix)]
+            let lock_name = config.database.clone();
+            #[cfg(not(unix))]
+            let lock_name = {
+                let path = std::fs::canonicalize(&config.database)
+                    .unwrap_or_else(|_| config.database.clone());
+                let mut name = path.into_os_string();
+                name.push(".lock");
+                name
+            };
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(false);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately excluding FILE_SHARE_DELETE.
+                options.share_mode(3);
+            }
+            let file = options
+                .open(lock_name)
+                .context("cannot open database ownership lock")?;
+            file.try_lock_exclusive()
+                .context("database is already owned by another rproxy process")?;
+            Some(Arc::new(file))
+        };
+        let connection =
+            Connection::open(&config.database).context("cannot open SQLite database")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > 1 {
+            bail!("unsupported database schema version {version}");
+        }
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+            CREATE TABLE IF NOT EXISTS proxies (id TEXT PRIMARY KEY, record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS businesses (name TEXT PRIMARY KEY, state TEXT NOT NULL);
+            PRAGMA user_version=1;",
+        )?;
+        let mut records = BTreeMap::new();
+        {
+            let mut statement = connection.prepare("SELECT id, record FROM proxies")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, json) = row?;
+                let record: Candidate =
+                    serde_json::from_str(&json).context("corrupt proxy state")?;
+                if id != format!("{}:{}", record.protocol, record.address) {
+                    bail!("invalid persisted proxy identity");
+                }
+                if let Some(proxy) = &record.verified {
+                    proxy.validate()?;
+                    if proxy.id != id {
+                        bail!("persisted metadata belongs to another proxy");
+                    }
+                }
+                records.insert(id, record);
+            }
+        }
+        let mut businesses = BTreeMap::new();
+        {
+            let mut statement = connection.prepare("SELECT name, state FROM businesses")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (name, json) = row?;
+                let mut business: Business =
+                    serde_json::from_str(&json).context("corrupt routing state")?;
+                if !crate::config::valid_identifier(&name) {
+                    bail!("invalid persisted business identity");
+                }
+                business.validate()?;
+                business.sessions.retain(|_, session| !session.releasing);
+                businesses.insert(name, business);
+            }
+        }
         Ok(Self {
             connection,
-            prefix: config.redis_key.clone(),
-            timeout,
+            _lock: lock,
+            records,
+            businesses,
+            cooldown: HashMap::new(),
+            auth: HashMap::new(),
+            capacity: config.max_proxies,
+            max_age: config.probe.max_age_seconds,
         })
     }
-
+    fn save_business(&mut self, name: &str, business: Business) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO businesses(name,state) VALUES (?1,?2)
+            ON CONFLICT(name) DO UPDATE SET state=excluded.state",
+            params![name, serde_json::to_string(&business)?],
+        )?;
+        self.businesses.insert(name.to_owned(), business);
+        Ok(())
+    }
+    fn save_record(&mut self, id: String, record: Candidate) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO proxies(id,record) VALUES (?1,?2)
+            ON CONFLICT(id) DO UPDATE SET record=excluded.record",
+            params![id, serde_json::to_string(&record)?],
+        )?;
+        self.records.insert(id, record);
+        Ok(())
+    }
+}
+impl Store {
+    pub async fn open(config: &Config) -> Result<Self> {
+        let config = config.clone();
+        let (sender, receiver) = mpsc::channel::<Job>();
+        let (ready, wait) = oneshot::channel();
+        let thread = thread::Builder::new()
+            .name("rproxy-state".into())
+            .spawn(move || {
+                let mut database = match Database::open(&config) {
+                    Ok(database) => {
+                        let _ = ready.send(Ok(database._lock.clone()));
+                        database
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                while let Ok(job) = receiver.recv() {
+                    job(&mut database);
+                }
+            })?;
+        let lock = wait
+            .await
+            .context("state worker stopped during initialization")??;
+        let (changes, _) = watch::channel(0);
+        Ok(Self {
+            worker: Arc::new(Worker {
+                sender: Some(sender),
+                thread: Some(thread),
+                permits: Arc::new(Semaphore::new(256)),
+                _lock: lock,
+            }),
+            changes: Arc::new(changes),
+        })
+    }
+    async fn call<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let permit = self.worker.permits.clone().acquire_owned().await?;
+        let (reply, result) = oneshot::channel();
+        self.worker
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Box::new(move |database| {
+                let _permit = permit;
+                let _ = reply.send(job(database));
+            }))
+            .map_err(|_| anyhow::anyhow!("state worker stopped"))?;
+        tokio::time::timeout(Duration::from_secs(10), result)
+            .await
+            .context("state operation timed out")?
+            .context("state worker stopped")?
+    }
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+    pub fn request_probe(&self) {
+        self.changes
+            .send_modify(|value| *value = value.wrapping_add(1));
+    }
+    pub async fn status(&self) -> Result<Status> {
+        self.call(|db| {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            Ok(Status {
+                candidates: db.records.len(),
+                verified: db
+                    .records
+                    .values()
+                    .filter(|r| {
+                        r.verified.as_ref().is_some_and(|p| {
+                            p.stable && p.verified_at.saturating_add(db.max_age) >= now
+                        })
+                    })
+                    .count(),
+                sessions: db.businesses.values().map(|b| b.sessions.len()).sum(),
+                connections: db
+                    .businesses
+                    .values()
+                    .flat_map(|b| b.sessions.values())
+                    .map(|s| s.active.len())
+                    .sum(),
+            })
+        })
+        .await
+    }
+    pub async fn add_candidates(
+        &self,
+        protocol: Protocol,
+        addresses: Vec<SocketAddr>,
+        source: String,
+    ) -> Result<usize> {
+        if source.len() > 64 || source.is_empty() || addresses.len() > 256 {
+            bail!("invalid candidate batch");
+        }
+        if addresses
+            .iter()
+            .any(|a| a.port() == 0 || a.ip().is_unspecified())
+        {
+            bail!("invalid candidate address");
+        }
+        let added = self
+            .call(move |db| {
+                let mut entries = BTreeMap::new();
+                for address in addresses {
+                    let id = format!("{protocol}:{address}");
+                    if !db.records.contains_key(&id) {
+                        entries.insert(
+                            id,
+                            Candidate {
+                                protocol,
+                                address,
+                                source: source.clone(),
+                                generation: format!("{:032x}", rand::random::<u128>()),
+                                verified: None,
+                            },
+                        );
+                    }
+                }
+                if db.records.len().saturating_add(entries.len()) > db.capacity {
+                    bail!("proxy capacity reached");
+                }
+                let transaction = db.connection.transaction()?;
+                for (id, record) in &entries {
+                    transaction.execute(
+                        "INSERT INTO proxies(id,record) VALUES (?1,?2)",
+                        params![id, serde_json::to_string(record)?],
+                    )?;
+                }
+                transaction.commit()?;
+                let count = entries.len();
+                db.records.extend(entries);
+                Ok(count)
+            })
+            .await?;
+        if added > 0 {
+            self.changes
+                .send_modify(|value| *value = value.wrapping_add(1));
+        }
+        Ok(added)
+    }
+    pub async fn candidates(&self) -> Result<Vec<Candidate>> {
+        self.call(|db| Ok(db.records.values().cloned().collect()))
+            .await
+    }
+    pub async fn pool_addresses(&self) -> Result<Vec<(Protocol, SocketAddr)>> {
+        Ok(self
+            .candidates()
+            .await?
+            .into_iter()
+            .map(|c| (c.protocol, c.address))
+            .collect())
+    }
     pub async fn save_proxy(&self, proxy: &Proxy) -> Result<()> {
         let proxy = proxy.normalized();
         proxy.validate()?;
-        let mut connection = self.connection.clone();
-        let _: () = tokio::time::timeout(
-            self.timeout,
-            redis::pipe()
-                .atomic()
-                .hset_nx(
-                    format!("{}:{}", self.prefix, proxy.protocol),
-                    proxy.address.to_string(),
-                    "{}",
-                )
-                .hset(
-                    format!("{}:verified", self.prefix),
-                    &proxy.id,
-                    serde_json::to_string(&proxy)?,
-                )
-                .query_async(&mut connection),
-        )
-        .await
-        .context("Redis save timed out")??;
-        Ok(())
-    }
-
-    pub async fn pool_addresses(&self) -> Result<Vec<(Protocol, std::net::SocketAddr)>> {
-        let mut connection = self.connection.clone();
-        let mut result = Vec::new();
-        for protocol in [Protocol::Http, Protocol::Socks5] {
-            let addresses: Vec<String> = tokio::time::timeout(
-                self.timeout,
-                connection.hkeys(format!("{}:{}", self.prefix, protocol)),
-            )
-            .await
-            .context("Redis pool read timed out")??;
-            for address in addresses {
-                if let Ok(address) = address.parse() {
-                    result.push((protocol, address));
-                }
+        self.call(move |db| {
+            let id = proxy.id.clone();
+            if !db.records.contains_key(&id) && db.records.len() >= db.capacity {
+                bail!("proxy capacity reached");
             }
-        }
-        Ok(result)
+            let mut record = db.records.get(&id).cloned().unwrap_or(Candidate {
+                protocol: proxy.protocol,
+                address: proxy.address,
+                source: "local".into(),
+                generation: format!("{:032x}", rand::random::<u128>()),
+                verified: None,
+            });
+            record.verified = Some(proxy);
+            db.save_record(id, record)
+        })
+        .await
     }
-
-    pub async fn update_verified(&self, proxy: &Proxy) -> Result<()> {
+    pub async fn update_probe(&self, proxy: &Proxy, generation: String) -> Result<bool> {
         let proxy = proxy.normalized();
         proxy.validate()?;
-        let mut connection = self.connection.clone();
-        let _: i32 = tokio::time::timeout(self.timeout, redis::Script::new(
-            "if redis.call('HEXISTS',KEYS[1],ARGV[1])==0 then return 0 end; redis.call('HSET',KEYS[2],ARGV[2],ARGV[3]); return 1")
-            .key(format!("{}:{}", self.prefix, proxy.protocol))
-            .key(format!("{}:verified", self.prefix))
-            .arg(proxy.address.to_string()).arg(&proxy.id).arg(serde_json::to_string(&proxy)?)
-            .invoke_async(&mut connection)).await.context("Redis metadata update timed out")??;
-        Ok(())
-    }
-
-    pub async fn metadata(&self) -> Result<Vec<Proxy>> {
-        let mut connection = self.connection.clone();
-        let values: Vec<String> = tokio::time::timeout(
-            self.timeout,
-            connection.hvals(format!("{}:verified", self.prefix)),
-        )
+        self.call(move |db| {
+            let Some(mut record) = db
+                .records
+                .get(&proxy.id)
+                .filter(|r| r.generation == generation)
+                .cloned()
+            else {
+                return Ok(false);
+            };
+            let id = proxy.id.clone();
+            if !proxy.stable {
+                db.connection
+                    .execute("DELETE FROM proxies WHERE id=?1", [&id])?;
+                db.records.remove(&id);
+                return Ok(true);
+            }
+            record.verified = Some(proxy);
+            db.save_record(id, record)?;
+            Ok(true)
+        })
         .await
-        .context("Redis metadata read timed out")??;
-        let mut proxies: Vec<_> = values
-            .into_iter()
-            .filter_map(|value| {
-                let proxy: Proxy = serde_json::from_str(&value).ok()?;
-                proxy.validate().is_ok().then_some(proxy)
-            })
-            .collect();
-        proxies.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(proxies)
     }
-
+    pub async fn probe_failed(&self, id: &str, generation: String) -> Result<bool> {
+        let id = id.to_owned();
+        self.call(move |db| {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let removable = db.records.get(&id).is_some_and(|r| {
+                r.generation == generation
+                    && r.verified
+                        .as_ref()
+                        .is_none_or(|p| !p.stable || p.verified_at.saturating_add(db.max_age) < now)
+            });
+            if removable {
+                db.connection
+                    .execute("DELETE FROM proxies WHERE id=?1", [&id])?;
+                db.records.remove(&id);
+            }
+            Ok(removable)
+        })
+        .await
+    }
+    pub async fn remove_proxy(&self, id: &str) -> Result<()> {
+        let id = id.to_owned();
+        self.call(move |db| {
+            db.connection
+                .execute("DELETE FROM proxies WHERE id=?1", [&id])?;
+            db.records.remove(&id);
+            Ok(())
+        })
+        .await
+    }
+    pub async fn metadata(&self) -> Result<Vec<Proxy>> {
+        self.call(|db| {
+            Ok(db
+                .records
+                .values()
+                .filter_map(|r| r.verified.clone())
+                .collect())
+        })
+        .await
+    }
     pub async fn proxies(&self) -> Result<Vec<Proxy>> {
         Ok(self
             .metadata()
             .await?
             .into_iter()
-            .filter(|proxy| proxy.stable)
+            .filter(|p| p.stable)
             .collect())
     }
-
-    pub async fn operation(&self, identity: &Identity, mut request: Value) -> Result<Value> {
-        request["identity"] = json!({
-            "owner": identity.owner, "session": identity.session, "strategy": identity.strategy,
-        });
-        let mut connection = self.connection.clone();
-        let script = redis::Script::new(include_str!("lua/routing.lua"));
-        let output: String = tokio::time::timeout(
-            self.timeout,
-            script
-                .key(format!("{}:route:{}", self.prefix, identity.business))
-                .key(format!("{}:cooldown", self.prefix))
-                .key(format!("{}:http", self.prefix))
-                .key(format!("{}:socks5", self.prefix))
-                .key(format!("{}:verified", self.prefix))
-                .arg(serde_json::to_string(&request)?)
-                .invoke_async(&mut connection),
-        )
+    pub async fn reserve(
+        &self,
+        identity: &Identity,
+        token: String,
+        capability: Capability,
+    ) -> Result<(Proxy, bool)> {
+        let identity = identity.clone();
+        self.call(move |db| {
+            let mut business = db
+                .businesses
+                .get(&identity.business)
+                .cloned()
+                .unwrap_or_default();
+            let proxies: Vec<_> = db
+                .records
+                .values()
+                .filter_map(|r| r.verified.clone())
+                .collect();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let result = business.reserve(
+                &identity,
+                token,
+                capability,
+                &proxies,
+                &db.cooldown,
+                now.saturating_sub(db.max_age),
+            )?;
+            db.save_business(&identity.business, business)?;
+            Ok(result)
+        })
         .await
-        .context("Redis routing timed out")??;
-        let output: Value = serde_json::from_str(&output)?;
-        if let Some(error) = output.get("error").and_then(Value::as_str) {
-            bail!("{error}");
-        }
-        Ok(output)
     }
-
+    pub async fn release(&self, identity: &Identity, token: &str) -> Result<()> {
+        let identity = identity.clone();
+        let token = token.to_owned();
+        self.call(move |db| Self::release_in(db, &identity, &token))
+            .await
+    }
+    fn release_in(db: &mut Database, identity: &Identity, token: &str) -> Result<()> {
+        // Occupancy is runtime-only: cleanup must still work if the disk becomes unwritable.
+        if let Some(business) = db.businesses.get_mut(&identity.business) {
+            business.release(identity, token)?;
+        }
+        Ok(())
+    }
+    pub fn release_now(&self, identity: Identity, token: String) {
+        let _ = self
+            .worker
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Box::new(move |db| {
+                if let Err(error) = Self::release_in(db, &identity, &token) {
+                    log::warn!("connection cleanup failed: {error}");
+                }
+            }));
+    }
+    pub async fn active(&self, identity: &Identity, token: &str) -> Result<()> {
+        let identity = identity.clone();
+        let token = token.to_owned();
+        self.call(move |db| {
+            let session = db
+                .businesses
+                .get_mut(&identity.business)
+                .map(|b| b.session(&identity))
+                .transpose()?
+                .flatten();
+            if !session.is_some_and(|s| s.active.contains_key(&token)) {
+                bail!("connection occupancy released");
+            }
+            Ok(())
+        })
+        .await
+    }
+    pub async fn fail(
+        &self,
+        identity: &Identity,
+        proxy_id: &str,
+        cooldown: Duration,
+    ) -> Result<()> {
+        let identity = identity.clone();
+        let proxy_id = proxy_id.to_owned();
+        self.call(move |db| {
+            let mut business = db
+                .businesses
+                .get(&identity.business)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(session) = business.session(&identity)? {
+                if session.binding.as_ref().is_some_and(|p| p.id == proxy_id) {
+                    session.previous = session.binding.take();
+                }
+            }
+            db.save_business(&identity.business, business)?;
+            db.cooldown.insert(proxy_id, Instant::now() + cooldown);
+            Ok(())
+        })
+        .await
+    }
+    pub async fn release_session(&self, identity: &Identity) -> Result<()> {
+        let identity = identity.clone();
+        self.call(move |db| {
+            let mut business = db
+                .businesses
+                .get(&identity.business)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(session) = business.session(&identity)? {
+                session.releasing = true;
+                session.binding = None;
+                if session.active.is_empty() {
+                    business.sessions.remove(&identity.session);
+                }
+            }
+            db.save_business(&identity.business, business)
+        })
+        .await
+    }
     pub async fn authenticate(&self, identity: &Identity, ttl: u64) -> Result<bool> {
-        let mut connection = self.connection.clone();
-        let renewed: i32 = tokio::time::timeout(self.timeout, redis::Script::new(
-            "local v=redis.call('GET',KEYS[1]); if v~=ARGV[1] then redis.call('SET',KEYS[1],ARGV[1],'EX',ARGV[2]); return 1 end; return 0")
-            .key(format!("{}:auth:{}", self.prefix, identity.owner))
-            .arg(identity.credential_version).arg(ttl)
-            .invoke_async(&mut connection)).await.context("Redis authentication timed out")??;
-        Ok(renewed == 1)
+        let identity = identity.clone();
+        self.call(move |db| {
+            let now = Instant::now();
+            if db
+                .auth
+                .get(&identity.owner)
+                .is_some_and(|(version, until)| {
+                    *version == identity.credential_version && *until > now
+                })
+            {
+                return Ok(false);
+            }
+            db.auth.insert(
+                identity.owner,
+                (identity.credential_version, now + Duration::from_secs(ttl)),
+            );
+            Ok(true)
+        })
+        .await
     }
 }

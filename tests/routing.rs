@@ -21,13 +21,12 @@ fn id(business: &str, session: &str, strategy: Strategy) -> Identity {
 
 async fn fixture(ips: &[&str]) -> (Config, Store, Router) {
     let config = Config {
-        redis_url: std::env::var("RPROXY_TEST_REDIS").unwrap_or("redis://127.0.0.1:16379/".into()),
-        redis_key: format!("rproxy-test-{}", rand::random::<u64>()),
+        database: ":memory:".into(),
         ..Config::default()
     };
-    let store = Store::connect(&config)
+    let store = Store::open(&config)
         .await
-        .expect("real test Redis required (RPROXY_TEST_REDIS)");
+        .expect("isolated SQLite state worker required");
     for (index, ip) in ips.iter().enumerate() {
         let proxy = Proxy {
             id: format!("http:127.0.0.1:{}", 20000 + index),
@@ -205,15 +204,20 @@ async fn failed_stick_switches_once_while_old_egress_stays_reserved() {
 }
 
 #[tokio::test]
-async fn expired_leases_cannot_be_renewed_and_nonstick_egress_is_reclaimed() {
-    let (mut config, store, _) = fixture(&["1.1.1.1"]).await;
-    config.routing.lease_seconds = 1;
+async fn live_nonstick_occupancy_is_reclaimed_only_after_release() {
+    let (config, store, _) = fixture(&["1.1.1.1"]).await;
     let router = Router::new(config, store);
     let old = router
         .reserve(&id("shop", "a", Strategy::RoundRobin), Capability::Forward)
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(1150)).await;
+    old.renew().await.unwrap();
+    assert!(router
+        .reserve(&id("shop", "b", Strategy::Stick), Capability::Forward)
+        .await
+        .is_err());
+    old.release().await.unwrap();
     assert!(old.renew().await.is_err());
     let r = router
         .reserve(&id("shop", "b", Strategy::Stick), Capability::Forward)

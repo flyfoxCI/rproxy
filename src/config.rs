@@ -11,8 +11,9 @@ use crate::routing::Strategy;
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    pub redis_url: String,
-    pub redis_key: String,
+    pub database: PathBuf,
+    pub max_proxies: usize,
+    pub admin: AdminConfig,
     pub http_bind: Option<SocketAddr>,
     pub socks5_bind: Option<SocketAddr>,
     pub https_bind: Option<SocketAddr>,
@@ -25,8 +26,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            redis_url: "redis://127.0.0.1:6379/".into(),
-            redis_key: "proxy:pool".into(),
+            database: "data/rproxy.sqlite3".into(),
+            max_proxies: 1000,
+            admin: AdminConfig::default(),
             http_bind: Some("127.0.0.1:9099".parse().unwrap()),
             socks5_bind: Some("127.0.0.1:9089".parse().unwrap()),
             https_bind: None,
@@ -34,6 +36,23 @@ impl Default for Config {
             auth: AuthConfig::default(),
             routing: RoutingConfig::default(),
             probe: ProbeConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminConfig {
+    pub enabled: bool,
+    pub bind: SocketAddr,
+    pub token_env: String,
+}
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind: "127.0.0.1:9100".parse().unwrap(),
+            token_env: "RPROXY_ADMIN_TOKEN".into(),
         }
     }
 }
@@ -71,7 +90,10 @@ impl Default for AuthConfig {
 #[serde(deny_unknown_fields)]
 pub struct User {
     pub name: String,
+    #[serde(default)]
     pub password: String,
+    #[serde(default)]
+    pub password_env: Option<String>,
     pub businesses: Vec<String>,
     #[serde(default = "one")]
     pub version: u64,
@@ -83,8 +105,6 @@ fn one() -> u64 {
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
-    pub lease_seconds: u64,
-    pub renew_seconds: u64,
     pub connect_timeout_seconds: u64,
     pub handshake_timeout_seconds: u64,
     pub cooldown_seconds: u64,
@@ -94,8 +114,6 @@ pub struct RoutingConfig {
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            lease_seconds: 30,
-            renew_seconds: 5,
             connect_timeout_seconds: 10,
             handshake_timeout_seconds: 15,
             cooldown_seconds: 30,
@@ -144,7 +162,12 @@ pub fn valid_identifier(value: &str) -> bool {
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self> {
-        let config: Self = toml::from_str(text).context("invalid configuration")?;
+        let config: Self = toml::from_str(text).map_err(|error: toml::de::Error| {
+            // TOML's Display includes the source line, which may contain a password.
+            let offset = error.span().map_or(0, |span| span.start.min(text.len()));
+            let line = text.as_bytes()[..offset].iter().filter(|byte| **byte == b'\n').count() + 1;
+            anyhow::anyhow!("invalid configuration near line {line}: check TOML syntax, field names and value types")
+        })?;
         config.validate()?;
         Ok(config)
     }
@@ -152,6 +175,9 @@ impl Config {
         let mut config =
             Self::parse(&std::fs::read_to_string(path).context("cannot read configuration")?)?;
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
+        if config.database != Path::new(":memory:") && config.database.is_relative() {
+            config.database = directory.join(&config.database);
+        }
         if let Some(tls) = &mut config.tls {
             if tls.certificate.is_relative() {
                 tls.certificate = directory.join(&tls.certificate);
@@ -167,9 +193,24 @@ impl Config {
         }
         Ok(config)
     }
+    pub fn resolve_secrets(&mut self) -> Result<()> {
+        for user in &mut self.auth.users {
+            if let Some(name) = user.password_env.take() {
+                user.password = std::env::var(&name).map_err(|_| {
+                    anyhow::anyhow!(
+                        "entry password environment variable {name} is missing or not valid UTF-8"
+                    )
+                })?;
+            }
+        }
+        self.validate()
+    }
     pub fn validate(&self) -> Result<()> {
-        if self.redis_key.is_empty() || self.redis_key.contains(['{', '}']) {
-            bail!("redis_key must be nonempty and contain no braces");
+        if self.database.as_os_str().is_empty() || self.max_proxies == 0 {
+            bail!("database path and positive max_proxies are required");
+        }
+        if self.admin.enabled && self.admin.token_env.is_empty() {
+            bail!("admin token_env is required");
         }
         if self.https_bind.is_some() && self.tls.is_none() {
             bail!("HTTPS listener requires certificate and private_key");
@@ -183,15 +224,13 @@ impl Config {
             }
         }
         let r = &self.routing;
-        if r.renew_seconds == 0
-            || r.lease_seconds < r.renew_seconds.saturating_mul(3)
-            || r.connect_timeout_seconds == 0
+        if r.connect_timeout_seconds == 0
             || r.handshake_timeout_seconds == 0
             || r.cooldown_seconds == 0
             || r.max_attempts == 0
             || r.max_connections == 0
         {
-            bail!("invalid routing timeouts, lease or limits");
+            bail!("invalid routing timeouts or limits");
         }
         if self.probe.timeout_seconds == 0
             || self.probe.concurrency == 0
@@ -213,7 +252,12 @@ impl Config {
         let mut names = HashSet::new();
         for user in &self.auth.users {
             if !valid_identifier(&user.name)
-                || user.password.is_empty()
+                || (user.password.is_empty() && user.password_env.is_none())
+                || (!user.password.is_empty() && user.password_env.is_some())
+                || user
+                    .password_env
+                    .as_ref()
+                    .is_some_and(|name| name.is_empty())
                 || user.password.len() > 255
                 || user.businesses.is_empty()
                 || !names.insert(&user.name)

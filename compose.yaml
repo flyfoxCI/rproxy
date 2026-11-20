@@ -1,0 +1,77 @@
+services:
+  rproxy:
+    build:
+      context: .
+      target: rproxy
+    user: "10001:10001"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    environment:
+      RPROXY_PASSWORD: ${RPROXY_PASSWORD:?Set RPROXY_PASSWORD in .env}
+      RPROXY_ADMIN_TOKEN: ${RPROXY_ADMIN_TOKEN:?Set RPROXY_ADMIN_TOKEN in .env}
+    # Container listeners must not use the native example's loopback addresses.
+    command:
+      - --config
+      - /etc/rproxy/rproxy.toml
+      - --database
+      - /var/lib/rproxy/rproxy.sqlite3
+      - --admin-bind
+      - 0.0.0.0:9100
+      - --http-bind
+      - 0.0.0.0:9099
+      - --socks5-bind
+      - 0.0.0.0:9089
+      - serve
+    ports:
+      - "${RPROXY_BIND_ADDRESS:-127.0.0.1}:${RPROXY_HTTP_PORT:-9099}:9099"
+      - "${RPROXY_BIND_ADDRESS:-127.0.0.1}:${RPROXY_SOCKS5_PORT:-9089}:9089"
+    volumes:
+      - type: bind
+        source: ${RPROXY_CONFIG:-./rproxy.toml}
+        target: /etc/rproxy/rproxy.toml
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: Z
+      - type: volume
+        source: rproxy-data
+        target: /var/lib/rproxy
+    healthcheck:
+      test: [CMD, rproxy, --config, /etc/rproxy/rproxy.toml, --admin-bind, "127.0.0.1:9100", healthcheck]
+      interval: 10s
+      timeout: 20s
+      start_period: 10s
+      retries: 3
+
+  collector:
+    build:
+      context: .
+      target: collector
+    user: "10001:10001"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      rproxy:
+        condition: service_healthy
+    environment:
+      RPROXY_ADMIN_TOKEN: ${RPROXY_ADMIN_TOKEN:?Set RPROXY_ADMIN_TOKEN in .env}
+    env_file:
+      - ${RPROXY_PROVIDERS_ENV:-./scripts/providers.env}
+    volumes:
+      - type: bind
+        source: ${RPROXY_COLLECTOR_CONFIG:-./scripts/proxy.toml}
+        target: /etc/rproxy/proxy.toml
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: Z
+
+volumes:
+  rproxy-data:

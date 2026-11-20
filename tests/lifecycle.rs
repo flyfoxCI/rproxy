@@ -17,11 +17,14 @@ use tokio::{
 
 async fn setup() -> (Config, Store) {
     let config = Config {
-        redis_url: std::env::var("RPROXY_TEST_REDIS").unwrap_or("redis://127.0.0.1:16379/".into()),
-        redis_key: format!("lifecycle-{}", rand::random::<u64>()),
+        database: ":memory:".into(),
+        admin: rproxy::config::AdminConfig {
+            enabled: false,
+            ..Default::default()
+        },
         ..Config::default()
     };
-    let store = Store::connect(&config).await.unwrap();
+    let store = Store::open(&config).await.unwrap();
     (config, store)
 }
 

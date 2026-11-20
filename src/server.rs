@@ -80,6 +80,8 @@ pub struct Server {
     https: Option<TcpListener>,
     socks: Option<TcpListener>,
     tls: Option<tokio_rustls::TlsAcceptor>,
+    admin: Option<TcpListener>,
+    admin_token: Option<Arc<String>>,
 }
 
 impl Server {
@@ -103,13 +105,27 @@ impl Server {
         if http.is_none() && https.is_none() && socks.is_none() {
             bail!("no listeners enabled");
         }
+        let (admin, admin_token) = if state.config.admin.enabled {
+            let token = crate::admin::token(&state.config)?;
+            (
+                Some(TcpListener::bind(state.config.admin.bind).await?),
+                Some(Arc::new(token)),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             state,
             http,
             https,
             socks,
             tls,
+            admin,
+            admin_token,
         })
+    }
+    pub fn admin_address(&self) -> Option<std::net::SocketAddr> {
+        self.admin.as_ref().and_then(|l| l.local_addr().ok())
     }
     pub fn http_address(&self) -> Option<std::net::SocketAddr> {
         self.http.as_ref().and_then(|l| l.local_addr().ok())
@@ -126,28 +142,39 @@ impl Server {
             ("http", self.http_address()),
             ("https", self.https_address()),
             ("socks5", self.socks_address()),
+            ("admin", self.admin_address()),
         ] {
             if let Some(address) = address {
                 log::info!("listening protocol={protocol} address={address}");
             }
         }
         let mut tasks = tokio::task::JoinSet::new();
-        if self.state.config.probe.enabled {
-            crate::upstream::verify_pool(&self.state.config, &self.state.router.store).await?;
-            let state = self.state.clone();
-            tasks.spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(state.config.probe.interval_seconds))
-                        .await;
-                    if crate::upstream::verify_pool(&state.config, &state.router.store)
-                        .await
-                        .is_err()
-                    {
-                        log::warn!("periodic pool verification could not complete");
+        let state = self.state.clone();
+        let mut changes = state.router.store.subscribe();
+        tasks.spawn(async move {
+            let pending = match state.router.store.candidates().await {
+                Ok(candidates) => candidates.iter().any(|candidate| candidate.verified.is_none()),
+                Err(_) => { log::error!("cannot restore pending verification state"); return; },
+            };
+            let mut verify = state.config.probe.enabled || pending;
+            loop {
+                if verify {
+                    changes.borrow_and_update();
+                    if crate::upstream::verify_pool(&state.config, &state.router.store).await.is_err() {
+                        log::warn!("pool verification could not complete");
                     }
                 }
-            });
-        }
+                tokio::select! {
+                    _ = changes.changed() => {},
+                    _ = async {
+                        if state.config.probe.enabled {
+                            tokio::time::sleep(Duration::from_secs(state.config.probe.interval_seconds)).await;
+                        } else { std::future::pending::<()>().await; }
+                    } => {},
+                }
+                verify = true;
+            }
+        });
         async fn accept(
             listener: &Option<TcpListener>,
         ) -> std::io::Result<(TcpStream, std::net::SocketAddr)> {
@@ -159,6 +186,7 @@ impl Server {
         let permits = Arc::new(tokio::sync::Semaphore::new(
             self.state.config.routing.max_connections,
         ));
+        let admin_permits = Arc::new(tokio::sync::Semaphore::new(32));
         tokio::pin!(shutdown);
         loop {
             let (accepted, protocol) = tokio::select! {
@@ -166,6 +194,7 @@ impl Server {
                 result = accept(&self.http) => (result, "http"),
                 result = accept(&self.https) => (result, "https"),
                 result = accept(&self.socks) => (result, "socks5"),
+                result = accept(&self.admin) => (result, "admin"),
                 _ = tasks.join_next(), if !tasks.is_empty() => continue,
             };
             let (stream, peer) = match accepted {
@@ -175,7 +204,12 @@ impl Server {
                     continue;
                 }
             };
-            let permit = match permits.clone().try_acquire_owned() {
+            let budget = if protocol == "admin" {
+                &admin_permits
+            } else {
+                &permits
+            };
+            let permit = match budget.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
                     log::warn!("connection limit reached");
@@ -185,9 +219,19 @@ impl Server {
             };
             let state = self.state.clone();
             let tls = self.tls.clone();
+            let admin_token = self.admin_token.clone();
             tasks.spawn(async move {
                 let _permit = permit;
                 let result = match protocol {
+                    "admin" => match tokio::time::timeout(
+                        Duration::from_secs(20),
+                        crate::admin::serve(stream, state, admin_token.unwrap()),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!("management connection timed out")),
+                    },
                     "socks5" => crate::socks5::serve_socks(stream, state).await,
                     "https" => {
                         let timeout =

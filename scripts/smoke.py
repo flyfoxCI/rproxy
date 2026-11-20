@@ -11,7 +11,6 @@ import tempfile
 import time
 from urllib.parse import quote
 
-import redis
 import requests
 
 
@@ -87,10 +86,8 @@ async def main(args):
     binary = pathlib.Path(args.binary).resolve()
     upstream = await asyncio.start_server(fake_upstream, "127.0.0.1", 0)
     address = upstream.sockets[0].getsockname()
-    prefix = "smoke-test-" + secrets.token_hex(8)
     password = secrets.token_urlsafe(24)
-    connection = redis.Redis.from_url(args.redis_url)
-    connection.hset(prefix + ":http", f"127.0.0.1:{address[1]}", "{}")
+    token = secrets.token_urlsafe(32)
     process = None
     try:
         with tempfile.TemporaryDirectory(prefix="rproxy-smoke-") as directory:
@@ -100,11 +97,12 @@ async def main(args):
                 "-keyout", str(key), "-out", str(certificate), "-days", "1", "-subj", "/CN=localhost",
                 "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             config = root / "proxy.toml"
-            config.write_text(f'''redis_url = "{args.redis_url}"
-redis_key = "{prefix}"
+            config.write_text(f'''database = "state.sqlite3"
 http_bind = "127.0.0.1:0"
 socks5_bind = "127.0.0.1:0"
 https_bind = "127.0.0.1:0"
+[admin]
+bind = "127.0.0.1:0"
 [tls]
 certificate = "cert.pem"
 private_key = "key.pem"
@@ -118,7 +116,8 @@ tunnel_url = "http://smoke.invalid/"
 ''', encoding="utf-8")
             log_path = root / "server.log"
             with log_path.open("w", encoding="utf-8") as log:
-                environment = {k: v for k, v in os.environ.items() if k not in ["RPROXY_REDIS_URL", "RPROXY_REDIS_KEY"]}
+                environment = {k: v for k, v in os.environ.items() if k != 'RPROXY_DATABASE'}
+                environment['RPROXY_ADMIN_TOKEN'] = token
                 process = subprocess.Popen([str(binary), "--config", str(config)], stdout=log, stderr=log, env=environment)
                 ports = {}
                 deadline = time.monotonic() + 20
@@ -128,12 +127,37 @@ tunnel_url = "http://smoke.invalid/"
                         raise RuntimeError(log_path.read_text(encoding="utf-8"))
                     text = log_path.read_text(encoding="utf-8")
                     ports = {scheme: int(port) for scheme, port in re.findall(r"listening protocol=(\w+) address=127\.0\.0\.1:(\d+)", text)}
-                    if len(ports) == 3 and connection.hexists(prefix + ":verified", f"http:127.0.0.1:{address[1]}"):
+                    if len(ports) == 4:
                         break
-                assert len(ports) == 3, "listeners did not become ready"
+                assert len(ports) == 4, "listeners did not become ready"
+                admin_url = f"http://127.0.0.1:{ports['admin']}"
+                def management(path, body=None):
+                    with requests.Session() as client:
+                        client.trust_env = False
+                        method = client.get if body is None else client.post
+                        response = method(admin_url + path, headers={'Authorization': 'Bearer ' + token},
+                                          **({} if body is None else {'json': body}), timeout=5)
+                        response.raise_for_status()
+                        return response.json()
+                imported = await asyncio.to_thread(management, '/v1/proxies', {
+                    'protocol': 'http', 'addresses': [f'127.0.0.1:{address[1]}'], 'source': 'smoke'})
+                assert imported['accepted'] == 1
+                while time.monotonic() < deadline:
+                    if (await asyncio.to_thread(management, '/v1/status'))['verified'] == 1:
+                        break
+                    await asyncio.sleep(0.05)
+                assert (await asyncio.to_thread(management, '/v1/status'))['verified'] == 1, 'candidate not admitted'
+                print('PASS candidate import through authenticated management interface', flush=True)
                 ports["socks5h"] = ports["socks5"]
                 try:
                     await asyncio.to_thread(clients, ports, password, certificate, args.browser)
+                    environment['RPROXY_PASSWORD'] = password
+                    released = await asyncio.to_thread(subprocess.run,
+                        [str(binary), '--config', str(config), '--admin-bind', f"127.0.0.1:{ports['admin']}",
+                         'release-session', '--username', 'v1|smoke|requests|client|stick'],
+                        env=environment, capture_output=True, timeout=10)
+                    assert released.returncode == 0, released.stderr.decode(errors='replace')
+                    print('PASS live release-session CLI without reopening SQLite', flush=True)
                 except Exception:
                     print(log_path.read_text(encoding="utf-8"))
                     raise
@@ -147,15 +171,10 @@ tunnel_url = "http://smoke.invalid/"
             process.wait()
         upstream.close()
         await upstream.wait_closed()
-        keys = list(connection.scan_iter(prefix + ":*"))
-        if keys:
-            connection.delete(*keys)
-        connection.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/rproxy.exe" if os.name == "nt" else "target/debug/rproxy")
-    parser.add_argument("--redis-url", default=os.environ.get("RPROXY_TEST_REDIS", "redis://127.0.0.1:16379/"))
     parser.add_argument("--browser", help="existing Chromium/Chrome executable; requires playwright")
     asyncio.run(main(parser.parse_args()))

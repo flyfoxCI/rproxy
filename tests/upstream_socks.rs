@@ -104,10 +104,8 @@ async fn ingress(authenticated: bool, protocol: Protocol) -> std::net::SocketAdd
     } else {
         Config::default()
     };
-    config.redis_url =
-        std::env::var("RPROXY_TEST_REDIS").unwrap_or("redis://127.0.0.1:16379/".into());
-    config.redis_key = format!("socks-test-{}", rand::random::<u64>());
-    let store = Store::connect(&config).await.unwrap();
+    config.database = ":memory:".into();
+    let store = Store::open(&config).await.unwrap();
     store.save_proxy(&proxy(protocol, address)).await.unwrap();
     let state = Arc::new(State {
         auth: Authenticator::new(&config),

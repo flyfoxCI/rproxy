@@ -1,21 +1,20 @@
+use crate::{config::Config, routing::Protocol};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::{net::SocketAddr, path::PathBuf};
 
-use crate::config::Config;
-
 #[derive(Parser)]
 #[command(
     version,
-    about = "Authenticated HTTP/HTTPS/SOCKS5 proxy with session routing"
+    about = "Authenticated HTTP/HTTPS/SOCKS5 proxy with embedded session routing"
 )]
 pub struct Args {
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
-    #[arg(short = 'r', long, global = true)]
-    pub redis_url: Option<String>,
     #[arg(long, global = true)]
-    pub redis_key: Option<String>,
+    pub database: Option<PathBuf>,
+    #[arg(long, global = true)]
+    pub admin_bind: Option<SocketAddr>,
     #[arg(short = 'H', long, global = true)]
     pub http_bind: Option<SocketAddr>,
     #[arg(short = 'S', long, global = true)]
@@ -33,16 +32,24 @@ pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
 }
-
 #[derive(Subcommand)]
 pub enum Command {
     /// Start the configured proxy listeners (the default).
     Serve,
-    /// Validate configuration and TLS files without connecting to Redis.
+    /// Validate configuration and TLS files without opening the state database.
     CheckConfig,
-    /// Verify actual egress and CONNECT capability for legacy pool addresses.
+    /// Check the running process through its authenticated management listener.
+    Healthcheck,
+    /// Verify actual egress and CONNECT capability in the running process.
     VerifyPool,
-    /// Release your business/session binding, retaining occupied exits until streams drain.
+    /// Submit one upstream candidate to the running process.
+    AddProxy {
+        #[arg(long)]
+        protocol: Protocol,
+        #[arg(long)]
+        address: SocketAddr,
+    },
+    /// Release a session in the running process, retaining occupancy until streams drain.
     ReleaseSession {
         #[arg(long)]
         username: String,
@@ -50,28 +57,23 @@ pub enum Command {
         password_env: String,
     },
 }
-
 impl Args {
     pub fn load_config(&self) -> Result<Config> {
         let mut config = self
             .config
             .as_ref()
-            .map(|path| Config::load(path))
+            .map(|p| Config::load(p))
             .transpose()?
             .unwrap_or_default();
-        if let Some(url) = self
-            .redis_url
+        if let Some(path) = self
+            .database
             .clone()
-            .or_else(|| std::env::var("RPROXY_REDIS_URL").ok())
+            .or_else(|| std::env::var_os("RPROXY_DATABASE").map(PathBuf::from))
         {
-            config.redis_url = url;
+            config.database = path;
         }
-        if let Some(key) = self
-            .redis_key
-            .clone()
-            .or_else(|| std::env::var("RPROXY_REDIS_KEY").ok())
-        {
-            config.redis_key = key;
+        if let Some(address) = self.admin_bind {
+            config.admin.bind = address;
         }
         if let Some(address) = self.http_bind {
             config.http_bind = Some(address);

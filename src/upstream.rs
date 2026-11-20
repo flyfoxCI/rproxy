@@ -214,14 +214,14 @@ pub async fn probe_one(
 }
 
 pub async fn verify_pool(config: &Config, store: &Store) -> Result<usize> {
-    let addresses = store.pool_addresses().await?;
-    let metadata = store.metadata().await?;
+    let candidates = store.candidates().await?;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(config.probe.concurrency));
     let mut jobs = tokio::task::JoinSet::new();
-    for (protocol, address) in addresses {
-        if metadata
-            .iter()
-            .any(|proxy| proxy.protocol == protocol && proxy.address == address && !proxy.stable)
+    for candidate in candidates {
+        if candidate
+            .verified
+            .as_ref()
+            .is_some_and(|proxy| !proxy.stable)
         {
             continue;
         }
@@ -230,13 +230,19 @@ pub async fn verify_pool(config: &Config, store: &Store) -> Result<usize> {
         let store = store.clone();
         jobs.spawn(async move {
             let _permit = permit;
-            match probe_one(&config, protocol, address).await {
+            match probe_one(&config, candidate.protocol, candidate.address).await {
                 Ok(proxy) => {
-                    store.update_verified(&proxy).await?;
-                    Ok::<_, anyhow::Error>(usize::from(proxy.stable))
+                    let updated = store.update_probe(&proxy, candidate.generation).await?;
+                    Ok::<_, anyhow::Error>(usize::from(updated && proxy.stable))
                 }
                 Err(_) => {
-                    log::warn!("exit verification failed upstream={protocol}:{address}");
+                    log::warn!(
+                        "exit verification failed upstream={}:{}",
+                        candidate.protocol,
+                        candidate.address
+                    );
+                    let id = format!("{}:{}", candidate.protocol, candidate.address);
+                    store.probe_failed(&id, candidate.generation).await?;
                     Ok(0)
                 }
             }
