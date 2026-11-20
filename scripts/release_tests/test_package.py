@@ -21,7 +21,10 @@ class ReleasePackagingTests(unittest.TestCase):
         (self.root / 'rproxy.toml').write_text('PRIVATE PASSWORD')
         (self.root / 'scripts').mkdir()
         (self.root / 'scripts/crawl.py').write_text('print("maintenance")')
-        (self.root / 'scripts/requirements.txt').write_text('redis>=5')
+        (self.root / 'scripts/requirements.txt').write_text('requests>=2.32')
+        (self.root / 'scripts/proxy.example.toml').write_text('[rproxy]')
+        (self.root / 'scripts/providers.env.example').write_text('# supplier environment')
+        (self.root / 'scripts/proxy.toml').write_text('PRIVATE SUPPLIER SECRET')
 
     def tearDown(self):
         self.directory.cleanup()
@@ -42,6 +45,9 @@ class ReleasePackagingTests(unittest.TestCase):
             self.assertIn(prefix + 'rproxy.exe', names)
             self.assertIn(prefix + 'scripts/crawl.py', names)
             self.assertNotIn(prefix + 'rproxy.toml', names)
+            self.assertIn(prefix + 'scripts/proxy.example.toml', names)
+            self.assertIn(prefix + 'scripts/providers.env.example', names)
+            self.assertNotIn(prefix + 'scripts/proxy.toml', names)
             self.assertEqual(bundle.read(prefix + 'rproxy.exe'), b'test executable')
 
     def test_linux_tar_has_executable_mode_and_matching_checksum(self):

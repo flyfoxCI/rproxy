@@ -1,7 +1,6 @@
 use crate::{auth::Identity, config::Config, store::Store};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
@@ -37,6 +36,16 @@ impl fmt::Display for Strategy {
 pub enum Protocol {
     Http,
     Socks5,
+}
+impl FromStr for Protocol {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "http" => Ok(Self::Http),
+            "socks5" => Ok(Self::Socks5),
+            _ => bail!("unsupported upstream protocol"),
+        }
+    }
 }
 impl fmt::Display for Protocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -111,17 +120,18 @@ impl Router {
         if *self.shutdown.borrow() {
             bail!("proxy server stopping");
         }
-        let proxies = self.store.proxies().await?;
-        let token = format!("{:032x}", rand::random::<u128>());
-        let result = self.store.operation(identity, json!({
-            "operation": "reserve", "token": token,
-            "lease_ms": self.config.routing.lease_seconds * 1000,
-            "max_age_ms": self.config.probe.max_age_seconds * 1000,
-            "capability": match capability { Capability::Forward => "forward", Capability::Tunnel => "tunnel" },
-            "random": rand::random::<u32>(), "proxies": proxies,
-        })).await?;
-        let proxy: Proxy = serde_json::from_value(result["proxy"].clone())?;
-        if result["changed"] == true {
+        // Create cleanup ownership before awaiting: cancellation must enqueue release after reserve.
+        let lease = Arc::new(Lease {
+            router: self.clone(),
+            identity: identity.clone(),
+            token: format!("{:032x}", rand::random::<u128>()),
+            released: AtomicBool::new(false),
+        });
+        let (proxy, changed) = self
+            .store
+            .reserve(identity, lease.token.clone(), capability)
+            .await?;
+        if changed {
             log::warn!(
                 "stick rebound business={} session={} new_proxy={} new_egress={}",
                 identity.business,
@@ -130,25 +140,15 @@ impl Router {
                 proxy.egress
             );
         }
-        Ok(Reservation {
-            proxy,
-            lease: Arc::new(Lease {
-                router: self.clone(),
-                identity: identity.clone(),
-                token,
-                released: AtomicBool::new(false),
-            }),
-        })
+        Ok(Reservation { proxy, lease })
     }
 
     pub async fn fail(&self, reservation: &Reservation, reason: &str) -> Result<()> {
         self.store
-            .operation(
+            .fail(
                 &reservation.lease.identity,
-                json!({
-                    "operation": "fail", "proxy_id": reservation.proxy.id,
-                    "cooldown_ms": self.config.routing.cooldown_seconds * 1000,
-                }),
+                &reservation.proxy.id,
+                Duration::from_secs(self.config.routing.cooldown_seconds),
             )
             .await?;
         log::warn!(
@@ -162,9 +162,7 @@ impl Router {
         Ok(())
     }
     pub async fn release_session(&self, identity: &Identity) -> Result<()> {
-        self.store
-            .operation(identity, json!({"operation": "release-session"}))
-            .await?;
+        self.store.release_session(identity).await?;
         Ok(())
     }
 }
@@ -178,19 +176,9 @@ struct Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         if !self.released.swap(true, Ordering::AcqRel) {
-            let store = self.router.store.clone();
-            let identity = self.identity.clone();
-            let token = self.token.clone();
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    if let Err(error) = store
-                        .operation(&identity, json!({"operation":"release", "token":token}))
-                        .await
-                    {
-                        log::warn!("lease cleanup failed: {error}");
-                    }
-                });
-            }
+            self.router
+                .store
+                .release_now(self.identity.clone(), self.token.clone());
         }
     }
 }
@@ -208,13 +196,7 @@ impl Reservation {
         self.lease
             .router
             .store
-            .operation(
-                &self.lease.identity,
-                json!({
-                    "operation": "renew", "token": self.lease.token,
-                    "lease_ms": self.lease.router.config.routing.lease_seconds * 1000,
-                }),
-            )
+            .active(&self.lease.identity, &self.lease.token)
             .await?;
         Ok(())
     }
@@ -222,27 +204,20 @@ impl Reservation {
         self.lease
             .router
             .store
-            .operation(
-                &self.lease.identity,
-                json!({"operation": "release", "token": self.lease.token}),
-            )
+            .release(&self.lease.identity, &self.lease.token)
             .await?;
         self.lease.released.store(true, Ordering::Release);
         Ok(())
     }
     pub async fn guard<F: std::future::Future>(&self, future: F) -> Result<F::Output> {
         tokio::pin!(future);
-        let interval = Duration::from_secs(self.lease.router.config.routing.renew_seconds);
         let mut shutdown = self.lease.router.shutdown.subscribe();
         if *shutdown.borrow() {
             bail!("proxy server stopping");
         }
-        loop {
-            tokio::select! {
-                result = &mut future => return Ok(result),
-                _ = shutdown.changed() => bail!("proxy server stopping"),
-                _ = tokio::time::sleep(interval) => { self.renew().await?; }
-            }
+        tokio::select! {
+            result = &mut future => Ok(result),
+            _ = shutdown.changed() => bail!("proxy server stopping"),
         }
     }
 }

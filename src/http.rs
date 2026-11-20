@@ -86,16 +86,7 @@ where
     let connection = builder
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades();
-    tokio::pin!(connection);
-    loop {
-        tokio::select! {
-            result = &mut connection => return result.context("HTTP client connection failed"),
-            _ = tokio::time::sleep(Duration::from_secs(state.config.routing.renew_seconds)) => {
-                let reservation = route.reservation.lock().await.clone();
-                if let Some(reservation) = reservation { reservation.renew().await?; }
-            }
-        }
-    }
+    connection.await.context("HTTP client connection failed")
 }
 
 fn error_response(status: StatusCode, message: &'static str) -> Response<Body> {

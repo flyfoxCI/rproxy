@@ -17,10 +17,9 @@ use tokio::{
 async fn fixture() -> (Config, Store) {
     let mut config = Config::default();
     config.probe.enabled = false;
-    config.redis_url =
-        std::env::var("RPROXY_TEST_REDIS").unwrap_or("redis://127.0.0.1:16379/".into());
-    config.redis_key = format!("regression-{}", rand::random::<u64>());
-    let store = Store::connect(&config).await.unwrap();
+    config.database = ":memory:".into();
+    config.admin.enabled = false;
+    let store = Store::open(&config).await.unwrap();
     (config, store)
 }
 fn proxy(port: u16, ip: &str) -> Proxy {
@@ -107,47 +106,15 @@ async fn server_shutdown_closes_upgraded_tunnels_not_only_listener_tasks() {
 }
 
 #[tokio::test]
-async fn redis_disconnect_closes_guarded_work_before_lease_expiration() {
-    let (mut config, _) = fixture().await;
-    let real = redis::Client::open(config.redis_url.as_str())
-        .unwrap()
-        .get_connection_info()
-        .addr
-        .clone();
-    let real = match real {
-        redis::ConnectionAddr::Tcp(host, port) => (host, port),
-        _ => panic!("TCP test Redis required"),
-    };
-    let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gateway_address = gateway.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let gateway_task = tokio::spawn(async move {
-        let mut jobs = tokio::task::JoinSet::new();
-        tokio::pin!(rx);
-        loop {
-            tokio::select! {
-                _=&mut rx=>break,
-                accepted=gateway.accept()=>{let(mut incoming,_)=accepted.unwrap();let real=real.clone();jobs.spawn(async move {let mut outgoing=TcpStream::connect(real).await.unwrap();let _=tokio::io::copy_bidirectional(&mut incoming,&mut outgoing).await;});}
-            }
-        }
-        jobs.abort_all();
-        while jobs.join_next().await.is_some() {}
-    });
-    config.redis_url = format!("redis://{gateway_address}/");
-    config.routing.renew_seconds = 1;
-    config.routing.lease_seconds = 6;
-    let store = Store::connect(&config).await.unwrap();
+async fn router_shutdown_ends_guarded_work_without_distributed_lease_timer() {
+    let (config, store) = fixture().await;
     store.save_proxy(&proxy(12345, "1.2.3.4")).await.unwrap();
     let router = Router::new(config.clone(), store);
     let identity = Authenticator::new(&config).anonymous().unwrap();
-    let lease = router.reserve(&identity, Capability::Tunnel).await.unwrap();
-    tx.send(()).unwrap();
-    gateway_task.await.unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_secs(4),
-        lease.guard(std::future::pending::<()>()),
-    )
-    .await;
-    assert!(result.is_ok());
-    assert!(result.unwrap().is_err());
+    let reservation = router.reserve(&identity, Capability::Tunnel).await.unwrap();
+    router.shutdown();
+    assert!(reservation
+        .guard(std::future::pending::<()>())
+        .await
+        .is_err());
 }

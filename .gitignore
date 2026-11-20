@@ -4,6 +4,12 @@
 /.superpowers/
 /data/
 /rproxy.toml
+/.env
+/.env.*
+!/.env.example
+/scripts/proxy.toml
+/scripts/providers.env
+/certs/
 *.pem
 __pycache__/
 *.pyc

@@ -29,7 +29,9 @@ def build_archive(root, target, tag, output):
         raise FileNotFoundError(executable)
     files = [(executable, name), (root / 'README.md', 'README.md'),
              (root / 'rproxy.example.toml', 'rproxy.example.toml'),
-             (root / 'scripts/requirements.txt', 'scripts/requirements.txt')]
+             (root / 'scripts/requirements.txt', 'scripts/requirements.txt'),
+             (root / 'scripts/proxy.example.toml', 'scripts/proxy.example.toml'),
+             (root / 'scripts/providers.env.example', 'scripts/providers.env.example')]
     files.extend((path, 'scripts/' + path.name) for path in sorted((root / 'scripts').glob('*.py')))
     for path, _ in files:
         if not path.is_file() or path.is_symlink():

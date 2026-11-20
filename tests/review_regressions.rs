@@ -1,4 +1,3 @@
-use redis::AsyncCommands;
 use rproxy::{
     auth::Authenticator,
     config::Config,
@@ -33,11 +32,10 @@ fn proxy(port: u16, ip: &str) -> Proxy {
 }
 async fn fixture() -> (Config, Store) {
     let config = Config {
-        redis_url: std::env::var("RPROXY_TEST_REDIS").unwrap_or("redis://127.0.0.1:16379/".into()),
-        redis_key: format!("review-test-{}", rand::random::<u64>()),
+        database: ":memory:".into(),
         ..Config::default()
     };
-    let store = Store::connect(&config).await.unwrap();
+    let store = Store::open(&config).await.unwrap();
     (config, store)
 }
 
@@ -61,28 +59,13 @@ async fn failed_reservation_keeps_old_stick_and_does_not_create_empty_session() 
         .reserve(&identity, Capability::Forward)
         .await
         .is_err());
-    let mut connection = redis::Client::open(config.redis_url.as_str())
-        .unwrap()
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
-    let json: String = connection
-        .get(format!("{}:route:default", config.redis_key))
-        .await
-        .unwrap();
-    let state: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(state["sessions"]["default"]["binding"]["id"], original.id);
+    assert_eq!(store.status().await.unwrap().sessions, 1);
     identity.session = "unallocated".into();
     assert!(router
         .reserve(&identity, Capability::Forward)
         .await
         .is_err());
-    let json: String = connection
-        .get(format!("{}:route:default", config.redis_key))
-        .await
-        .unwrap();
-    let state: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert!(state["sessions"].get("unallocated").is_none());
+    assert_eq!(store.status().await.unwrap().sessions, 1);
     store.save_proxy(&original).await.unwrap();
     let next = router
         .reserve(

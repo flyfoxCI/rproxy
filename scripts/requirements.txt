@@ -1,7 +1,2 @@
-aiohttp>=3.10,<4
 certifi>=2026.10.18
-aiohttp-socks>=0.9,<1
-redis>=5,<7
-requests>=2.32,<3
-schedule>=1.2,<2
-tenacity>=9,<10
+requests[socks]>=2.32,<3
