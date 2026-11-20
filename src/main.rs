@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         "info"
     }))
     .init();
-    let mut config = args.load_config()?;
+    let config = args.load_config()?;
     if matches!(args.command, Some(Command::CheckConfig)) {
         if let Some(tls) = &config.tls {
             tls_acceptor(tls)?;
@@ -57,12 +57,12 @@ async fn main() -> Result<()> {
             username,
             password_env,
         } => {
-            if config.auth.users.is_empty() {
+            if config.auth.mode == rproxy::config::AuthMode::Anonymous {
                 bail!("release-session requires configured authentication");
             }
             let password = std::env::var(password_env).map_err(|_| {
                 anyhow::anyhow!(
-                    "release credential environment variable is missing or not valid UTF-8"
+                    "release authentication credential environment variable is missing or not valid UTF-8"
                 )
             })?;
             println!(
@@ -76,7 +76,6 @@ async fn main() -> Result<()> {
             );
         }
         Command::Serve => {
-            config.resolve_secrets()?;
             let auth = Authenticator::new(&config);
             if !auth.required() {
                 log::warn!("anonymous proxy mode enabled; do not expose to untrusted networks");

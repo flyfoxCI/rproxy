@@ -46,6 +46,7 @@ pub struct AdminConfig {
     pub enabled: bool,
     pub bind: SocketAddr,
     pub token_env: String,
+    pub worker_token_env: String,
 }
 impl Default for AdminConfig {
     fn default() -> Self {
@@ -53,6 +54,7 @@ impl Default for AdminConfig {
             enabled: true,
             bind: "127.0.0.1:9100".parse().unwrap(),
             token_env: "RPROXY_ADMIN_TOKEN".into(),
+            worker_token_env: "RPROXY_WORKER_TOKEN".into(),
         }
     }
 }
@@ -64,9 +66,17 @@ pub struct TlsConfig {
     pub private_key: PathBuf,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    Required,
+    Anonymous,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
+    pub mode: AuthMode,
     pub ttl_seconds: u64,
     pub default_business: String,
     pub default_session: String,
@@ -77,6 +87,7 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
+            mode: AuthMode::Required,
             ttl_seconds: 3600,
             default_business: "default".into(),
             default_session: "default".into(),

@@ -26,7 +26,12 @@ pub(crate) struct Session {
     pub seen: HashSet<IpAddr>,
     pub releasing: bool,
     #[serde(skip)]
-    pub active: HashMap<String, IpAddr>,
+    pub active: HashMap<String, Active>,
+}
+#[derive(Clone)]
+pub(crate) struct Active {
+    pub egress: IpAddr,
+    pub proxy_id: String,
 }
 impl Business {
     pub fn validate(&self) -> Result<()> {
@@ -116,8 +121,8 @@ impl Business {
             if let Some(proxy) = &session.binding {
                 occupied.insert(proxy.egress, name);
             }
-            for egress in session.active.values() {
-                occupied.insert(*egress, name);
+            for active in session.active.values() {
+                occupied.insert(active.egress, name);
             }
         }
         let fresh = |proxy: &&Proxy| {
@@ -210,7 +215,13 @@ impl Business {
         };
         session.last = Some(proxy.egress);
         session.seen.insert(proxy.egress);
-        session.active.insert(token, proxy.egress);
+        session.active.insert(
+            token,
+            Active {
+                egress: proxy.egress,
+                proxy_id: proxy.id.clone(),
+            },
+        );
         Ok((proxy, changed))
     }
 }

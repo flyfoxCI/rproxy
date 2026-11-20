@@ -9,17 +9,22 @@ socks5_bind = "127.0.0.1:9089"
 [admin]
 enabled = true
 bind = "127.0.0.1:9100"
-token_env = "RPROXY_ADMIN_TOKEN" # At least 16 non-space ASCII characters.
+token_env = "RPROXY_ADMIN_TOKEN" # Root administration; at least 16 non-space ASCII characters.
+worker_token_env = "RPROXY_WORKER_TOKEN" # Collector only; must differ from root token.
 
 # [tls]
 # certificate = "certs/fullchain.pem"
 # private_key = "certs/private-key.pem"
 
 [auth]
+# Explicit policy, independent of user count. Deleting all users never enables anonymous entry.
+mode = "required" # Set "anonymous" only for a trusted, intentionally unauthenticated deployment.
 ttl_seconds = 3600
 default_session = "default"
 default_strategy = "random"
 
+# Imported ONCE on a new database / v0.2.2 upgrade. Later edits do not override managed users.
+# For an empty required-auth pool, remove this bootstrap table and add users with rproxy-cli.
 [[auth.users]]
 name = "alice"
 password_env = "RPROXY_PASSWORD"

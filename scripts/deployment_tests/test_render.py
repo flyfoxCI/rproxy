@@ -18,6 +18,7 @@ class ComposeRenderTests(unittest.TestCase):
         environment.update({
             'RPROXY_PASSWORD': 'render-test-password',
             'RPROXY_ADMIN_TOKEN': 'render-test-admin-token',
+            'RPROXY_WORKER_TOKEN': 'render-test-worker-token',
             'RPROXY_CONFIG': './rproxy.example.toml',
             'RPROXY_COLLECTOR_CONFIG': './scripts/proxy.example.toml',
             'RPROXY_PROVIDERS_ENV': './scripts/providers.env.example',
@@ -40,6 +41,8 @@ class ComposeRenderTests(unittest.TestCase):
         self.assertTrue(config['read_only'])
         self.assertFalse(config['bind']['create_host_path'])
         self.assertNotIn('RPROXY_PASSWORD', model['services']['collector']['environment'])
+        self.assertNotIn('RPROXY_ADMIN_TOKEN', model['services']['collector']['environment'])
+        self.assertIn('RPROXY_WORKER_TOKEN', model['services']['collector']['environment'])
 
     def test_host_ports_and_https_override_are_applied_without_changing_internal_ports(self):
         result = self.render({'RPROXY_HTTP_PORT': '19099', 'RPROXY_HTTPS_PORT': '19443'}, https=True)
@@ -52,7 +55,7 @@ class ComposeRenderTests(unittest.TestCase):
         self.assertFalse(certs['bind']['create_host_path'])
 
     def test_missing_secrets_fail_before_startup(self):
-        for name in ('RPROXY_PASSWORD', 'RPROXY_ADMIN_TOKEN'):
+        for name in ('RPROXY_ADMIN_TOKEN', 'RPROXY_WORKER_TOKEN'):
             with self.subTest(name=name):
                 result = self.render({name: ''})
                 self.assertNotEqual(result.returncode, 0)

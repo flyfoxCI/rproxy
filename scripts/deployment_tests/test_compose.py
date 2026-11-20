@@ -33,7 +33,9 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn('--admin-bind', rust['healthcheck']['test'])
         self.assertIn('healthcheck', rust['healthcheck']['test'])
         self.assertEqual(collector['depends_on']['rproxy']['condition'], 'service_healthy')
-        self.assertIn('RPROXY_ADMIN_TOKEN', collector['environment'])
+        self.assertIn('RPROXY_WORKER_TOKEN', collector['environment'])
+        self.assertNotIn('RPROXY_ADMIN_TOKEN', collector['environment'])
+        self.assertIn('RPROXY_WORKER_TOKEN', rust['environment'])
         self.assertNotIn('RPROXY_PASSWORD', collector['environment'])
         self.assertTrue(collector['env_file'])
         for service in (rust, collector):

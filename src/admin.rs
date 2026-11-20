@@ -15,7 +15,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::net::TcpStream;
-
+mod management;
 const MAX_BODY: usize = 65536;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,21 +30,41 @@ struct Release {
     username: String,
     password: String,
 }
-
+fn validate_token(value: &str) -> Result<()> {
+    if value.len() < 16 || value.len() > 1024 || value.bytes().any(|b| b <= 32 || b >= 127) {
+        bail!("management token must contain 16..1024 printable non-space ASCII characters");
+    }
+    Ok(())
+}
 pub fn token(config: &Config) -> Result<String> {
     let value = std::env::var(&config.admin.token_env).map_err(|_| {
         anyhow::anyhow!("management token environment variable is missing or not valid UTF-8")
     })?;
-    if value.len() < 16 || value.len() > 1024 || value.bytes().any(|b| b <= 32 || b >= 127) {
-        bail!("management token must contain 16..1024 printable non-space ASCII characters");
-    }
+    validate_token(&value)?;
     Ok(value)
+}
+pub fn worker_token(config: &Config, root: &str) -> Result<Option<String>> {
+    let Some(value) = std::env::var_os(&config.admin.worker_token_env) else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("worker token is not valid UTF-8"))?;
+    validate_token(&value)?;
+    if equal(root, &value) {
+        bail!("root and worker tokens must be different");
+    }
+    Ok(Some(value))
+}
+fn equal(left: &str, right: &str) -> bool {
+    bool::from(Sha256::digest(left.as_bytes()).ct_eq(&Sha256::digest(right.as_bytes())))
 }
 fn response(status: StatusCode, body: Value) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
         .header("Cache-Control", "no-store")
+        .header("Connection", "close")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap()
 }
@@ -54,7 +74,8 @@ fn error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
 async fn handle(
     mut request: Request<Incoming>,
     state: Arc<State>,
-    token: Arc<String>,
+    root: Arc<String>,
+    worker: Option<Arc<String>>,
 ) -> Response<Full<Bytes>> {
     let headers: Vec<_> = request.headers().get_all("authorization").iter().collect();
     let supplied = if headers.len() == 1 {
@@ -65,9 +86,10 @@ async fn handle(
     } else {
         None
     };
-    if !supplied.is_some_and(|s| {
-        bool::from(Sha256::digest(s.as_bytes()).ct_eq(&Sha256::digest(token.as_bytes())))
-    }) {
+    let is_root = supplied.is_some_and(|value| equal(value, &root));
+    let is_worker =
+        supplied.is_some_and(|value| worker.as_ref().is_some_and(|token| equal(value, token)));
+    if !is_root && !is_worker {
         return error(
             StatusCode::UNAUTHORIZED,
             "management authentication required",
@@ -75,14 +97,21 @@ async fn handle(
     }
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
+    let query = request.uri().query().unwrap_or("").to_owned();
+    if !is_root
+        && !((method == Method::GET && path == "/v1/collector/plan")
+            || (method == Method::POST && path == "/v1/collector/results"))
+    {
+        return error(
+            StatusCode::FORBIDDEN,
+            "worker credential cannot access root management",
+        );
+    }
     if method == Method::GET && matches!(path.as_str(), "/health" | "/v1/status") {
         return match state.router.store.status().await {
             Ok(status) => response(StatusCode::OK, serde_json::to_value(status).unwrap()),
             Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "state worker unavailable"),
         };
-    }
-    if method != Method::POST {
-        return error(StatusCode::NOT_FOUND, "unknown management operation");
     }
     if request
         .headers()
@@ -94,17 +123,17 @@ async fn handle(
         return error(StatusCode::PAYLOAD_TOO_LARGE, "request too large");
     }
     let body = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut body = Vec::new();
+        let mut bytes = Vec::new();
         while let Some(frame) = request.body_mut().frame().await {
             let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
-            if let Ok(bytes) = frame.into_data() {
-                if body.len().saturating_add(bytes.len()) > MAX_BODY {
+            if let Ok(data) = frame.into_data() {
+                if bytes.len().saturating_add(data.len()) > MAX_BODY {
                     return Err(StatusCode::PAYLOAD_TOO_LARGE);
                 }
-                body.extend_from_slice(&bytes);
+                bytes.extend_from_slice(&data);
             }
         }
-        Ok(body)
+        Ok(bytes)
     })
     .await;
     let body = match body {
@@ -112,6 +141,12 @@ async fn handle(
         Ok(Err(status)) => return error(status, "invalid or oversized request"),
         Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "request body timed out"),
     };
+    if let Some(response) = management::handle(&method, &path, &query, &body, &state).await {
+        return response;
+    }
+    if method != Method::POST {
+        return error(StatusCode::NOT_FOUND, "unknown management operation");
+    }
     match path.as_str() {
         "/v1/proxies" => {
             let import: Import = match serde_json::from_slice(&body) {
@@ -120,8 +155,7 @@ async fn handle(
             };
             if import.addresses.is_empty()
                 || import.addresses.len() > 256
-                || import.source.is_empty()
-                || import.source.len() > 64
+                || !crate::config::valid_identifier(&import.source)
                 || import
                     .addresses
                     .iter()
@@ -129,13 +163,21 @@ async fn handle(
             {
                 return error(StatusCode::BAD_REQUEST, "invalid candidate batch");
             }
+            let ids: Vec<_> = import
+                .addresses
+                .iter()
+                .map(|address| format!("{}:{address}", import.protocol))
+                .collect();
             match state
                 .router
                 .store
                 .add_candidates(import.protocol, import.addresses, import.source)
                 .await
             {
-                Ok(accepted) => response(StatusCode::ACCEPTED, json!({"accepted":accepted})),
+                Ok(accepted) => response(
+                    StatusCode::ACCEPTED,
+                    json!({"accepted":accepted,"ids":ids,"verification":"pending"}),
+                ),
                 Err(_) => error(
                     StatusCode::CONFLICT,
                     "candidate submission failed (capacity or state unavailable)",
@@ -147,8 +189,8 @@ async fn handle(
             response(StatusCode::ACCEPTED, json!({"scheduled":true}))
         }
         "/v1/sessions/release" => {
-            let release: Release = match serde_json::from_slice(&body) {
-                Ok(release) => release,
+            let request: Release = match serde_json::from_slice(&body) {
+                Ok(request) => request,
                 Err(_) => return error(StatusCode::BAD_REQUEST, "invalid release request"),
             };
             if !state.auth.required() {
@@ -158,7 +200,7 @@ async fn handle(
                 );
             }
             let identity = match state
-                .authenticate(Some((&release.username, &release.password)))
+                .authenticate(Some((&request.username, &request.password)))
                 .await
             {
                 Ok(identity) => identity,
@@ -173,10 +215,19 @@ async fn handle(
     }
 }
 pub async fn serve(stream: TcpStream, state: Arc<State>, token: Arc<String>) -> Result<()> {
+    serve_scoped(stream, state, token, None).await
+}
+pub async fn serve_scoped(
+    stream: TcpStream,
+    state: Arc<State>,
+    root: Arc<String>,
+    worker: Option<Arc<String>>,
+) -> Result<()> {
     let service = service_fn(move |request| {
         let state = state.clone();
-        let token = token.clone();
-        async move { Ok::<_, Infallible>(handle(request, state, token).await) }
+        let root = root.clone();
+        let worker = worker.clone();
+        async move { Ok::<_, Infallible>(handle(request, state, root, worker).await) }
     });
     hyper::server::conn::http1::Builder::new()
         .keep_alive(false)
@@ -196,12 +247,12 @@ pub async fn command(config: &Config, path: &str, body: Option<Value>) -> Result
             _ => IpAddr::V6(Ipv6Addr::LOCALHOST),
         });
     }
-    let url = format!("http://{address}{path}");
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let url = format!("http://{address}{path}");
     let request = if let Some(body) = body {
         client
             .post(&url)

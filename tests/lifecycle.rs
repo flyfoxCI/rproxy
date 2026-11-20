@@ -18,6 +18,10 @@ use tokio::{
 async fn setup() -> (Config, Store) {
     let config = Config {
         database: ":memory:".into(),
+        auth: rproxy::config::AuthConfig {
+            mode: rproxy::config::AuthMode::Anonymous,
+            ..Default::default()
+        },
         admin: rproxy::config::AdminConfig {
             enabled: false,
             ..Default::default()

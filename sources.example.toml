@@ -1,0 +1,37 @@
+# Import explicitly with: rproxy-cli source import sources.toml
+# Copy to sources.toml, keep only the sources you use, then supply provider env vars
+# to the collector (scripts/providers.env in Compose). This file is NOT auto-loaded.
+schema_version = 1
+
+[[sources]]
+name = "vendor-a"
+kind = "api"
+enabled = false # Change to true, or resume with rproxy-cli after configuration.
+
+[sources.config]
+url = "${SUPPLIER_API_URL}"
+protocol = "http" # Current upstream adapters: http or socks5, not HTTPS ingress.
+method = "GET"
+interval_seconds = 60
+timeout_seconds = 10
+attempts = 3
+[sources.config.params]
+count = 10
+[sources.config.headers]
+Authorization = "Bearer ${SUPPLIER_API_TOKEN}" # Remove if the supplier does not need it.
+[sources.config.response]
+format = "text" # One numeric IP:port per line; IPv6 uses [address]:port.
+
+# For a JSON API replace the response table above, for example:
+# [sources.config.response]
+# format = "json"
+# items_path = "data.proxies"
+# ip_path = "ip"
+# port_path = "port"
+# success_path = "code"
+# success_value = 0
+#
+# Old [[providers]] manifests, including the v0.2.2 Xdaili/Shenlong examples,
+# can also be explicitly imported. Confirm current URLs/schema with your provider.
+# Rola whitelist extraction can use these generic mappings if your account offers
+# it. Credentialed/rotating gateways and supplier sticky-session syntax are not supported.

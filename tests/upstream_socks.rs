@@ -102,7 +102,7 @@ async fn ingress(authenticated: bool, protocol: Protocol) -> std::net::SocketAdd
         Config::parse("[[auth.users]]\nname='alice'\npassword='secret'\nbusinesses=['shop']")
             .unwrap()
     } else {
-        Config::default()
+        Config::parse("[auth]\nmode='anonymous'").unwrap()
     };
     config.database = ":memory:".into();
     let store = Store::open(&config).await.unwrap();

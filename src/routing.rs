@@ -215,9 +215,14 @@ impl Reservation {
         if *shutdown.borrow() {
             bail!("proxy server stopping");
         }
-        tokio::select! {
-            result = &mut future => Ok(result),
-            _ = shutdown.changed() => bail!("proxy server stopping"),
+        let mut revocations = self.lease.router.store.subscribe_revocations();
+        self.renew().await?;
+        loop {
+            tokio::select! {
+                result = &mut future => return Ok(result),
+                _ = shutdown.changed() => bail!("proxy server stopping"),
+                _ = revocations.changed() => self.renew().await?,
+            }
         }
     }
 }
