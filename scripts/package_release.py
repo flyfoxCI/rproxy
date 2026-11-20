@@ -84,7 +84,9 @@ def native_management_smoke(server, cli):
                 deadline = time.monotonic() + 30
                 while True:
                     if process.poll() is not None:
-                        raise ValueError('native SQLite/server startup check failed')
+                        details = log_path.read_text(encoding='utf-8', errors='replace')[-4096:]
+                        details = details.replace(environment['RPROXY_ADMIN_TOKEN'], '<redacted>')
+                        raise ValueError(f'native SQLite/server startup check failed (exit {process.poll()}):\n{details}')
                     match = re.search(r'listening protocol=admin address=127\.0\.0\.1:(\d+)', log_path.read_text(encoding='utf-8', errors='replace'))
                     if match:
                         break
@@ -110,11 +112,12 @@ def native_management_smoke(server, cli):
 
 
 def package_native(root, target, tag, output):
-    """Validate the trusted, locally built CLI, then package (never downloaded inputs)."""
-    if target not in TARGETS or not re.fullmatch(r'v\d+\.\d+\.\d+', tag):
+    """Validate trusted local binaries; diagnostic refs can never publish archives."""
+    diagnostic = tag.startswith('diagnostic/')
+    if target not in TARGETS or (not diagnostic and not re.fullmatch(r'v\d+\.\d+\.\d+', tag)):
         raise ValueError('unsupported target or invalid release tag')
     version = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
-    if tag != 'v' + version:
+    if not diagnostic and tag != 'v' + version:
         raise ValueError('release tag must match Cargo.toml version')
     name = 'rproxy-cli.exe' if 'windows' in target else 'rproxy-cli'
     binary = root / 'target' / target / 'release' / name
@@ -132,6 +135,8 @@ def package_native(root, target, tag, output):
     if not server.is_file() or server.is_symlink():
         raise ValueError('native server must be a regular locally built file')
     native_management_smoke(server, binary)
+    if diagnostic:
+        raise ValueError('diagnostic-only native checks completed; refusing archive creation and publication')
     return build_archive(root, target, tag, output)
 
 

@@ -149,6 +149,34 @@ class ReleasePackagingTests(unittest.TestCase):
                     package_release.package_native(self.root, target, 'v0.2.0', self.root / 'bad-dist')
         self.assertFalse((self.root / 'bad-dist').exists())
 
+    def test_native_startup_error_preserves_reason_and_redacts_generated_token(self):
+        target = 'x86_64-pc-windows-msvc'
+        self.executable(target)
+        observed = {}
+        process = mock.Mock()
+        process.poll.return_value = 31
+        process.wait.return_value = 31
+        def exited(*args, **kwargs):
+            observed['token'] = kwargs['env']['RPROXY_ADMIN_TOKEN']
+            kwargs['stderr'].write('Error: database is locked; token=' + observed['token'] + '\n')
+            kwargs['stderr'].flush()
+            return process
+        with mock.patch.object(package_release.subprocess, 'Popen', side_effect=exited):
+            with self.assertRaises(ValueError) as failure:
+                package_release.native_management_smoke(self.root / 'target' / target / 'release/rproxy.exe', self.root / 'target' / target / 'release/rproxy-cli.exe')
+        self.assertIn('database is locked', str(failure.exception))
+        self.assertIn('31', str(failure.exception))
+        self.assertNotIn(observed['token'], str(failure.exception))
+
+    def test_diagnostic_ref_runs_native_checks_but_never_creates_archive(self):
+        target = 'x86_64-pc-windows-msvc'
+        self.executable(target)
+        with mock.patch.object(package_release.subprocess, 'run', return_value=mock.Mock(returncode=0, stdout='rproxy-cli 0.2.0\n')), mock.patch.object(package_release, 'native_management_smoke') as smoke:
+            with self.assertRaisesRegex(ValueError, 'diagnostic-only'):
+                package_release.package_native(self.root, target, 'diagnostic/macos-native-startup', self.root / 'dist')
+            smoke.assert_called_once()
+        self.assertFalse((self.root / 'dist').exists())
+
     def test_failed_native_management_startup_cannot_produce_archive(self):
         target = 'x86_64-pc-windows-msvc'
         self.executable(target)
