@@ -361,7 +361,7 @@ python scripts/collector.py --config scripts/proxy.toml
 
 ## 发布包与 Redis 迁移
 
-GitHub [Releases](https://github.com/flyfoxCI/rproxy/releases) 提供 Linux x86_64/ARM64、macOS Intel/Apple Silicon、Windows x86_64 包；使用同一 Release 的 `SHA256SUMS` 校验。Linux 发布包使用 musl 静态链接；macOS 目标 11.0+，未做 Apple Developer 签名/公证。
+当前 SQLite 架构对应 **0.2.2**，下载入口为 [v0.2.2 Release](https://github.com/flyfoxCI/rproxy/releases/tag/v0.2.2)。GitHub [Releases](https://github.com/flyfoxCI/rproxy/releases) 提供 Linux x86_64/ARM64、macOS Intel/Apple Silicon、Windows x86_64 包；使用同一 Release 的 `SHA256SUMS` 校验。Linux 发布包使用 musl 静态链接；macOS 目标 11.0+，未做 Apple Developer 签名/公证。
 
 **已经发布的 v0.2.1 是旧 Redis 架构，不能与当前 SQLite 配置混用。** 本文 Compose 从当前源码构建，不拉取一个未经发布的预构建镜像。
 

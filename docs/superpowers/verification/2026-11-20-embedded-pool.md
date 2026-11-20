@@ -2,7 +2,7 @@
 
 ## Scope
 
-Implemented on branch `v2.2`, package version `0.2.2`, based on main `0076f3e`. The requested delivery is a branch commit/push, not a main merge, release tag or published image. Existing releases are unchanged.
+Implemented on development branch `v2.2`, package version `0.2.2`, based on main `0076f3e`. The initial delivery was branch-only. The user subsequently clarified that the intended version is **0.2.2** and explicitly authorized merging into main and publishing the five-platform **v0.2.2** Release. Existing releases and tags must remain unchanged; no published container image is promised.
 
 - Rust owns candidate admission, actual-egress exclusion, session strategies, occupancy and persistent bindings. Redis and Lua routing are removed.
 - SQLite writes run on a dedicated state thread and commit before exposing changed durable state. Runtime occupancy is not persisted and is released by ownership handles; it does not expire under live sockets.
@@ -42,7 +42,7 @@ Additional invariants exercised include failed SQLite commits not publishing res
 
 ## Decisions and remaining boundaries
 
-- `v2.2` is a branch; the package follows the existing `0.2.x` series as `0.2.2`. A different version label can be chosen before any later release.
+- `v2.2` was only a development branch name. The user confirmed package version `0.2.2` and release tag `v0.2.2`; do not publish a `v2.2` version.
 - `verify-pool` is asynchronous: 202 `scheduled` is acknowledgement, not completion. Callers observe status instead of holding an unbounded management request.
 - SQLite is single-owner and local. No distributed backend, replica scaling or automatic Redis-session migration is included. Back up old Redis/config before switching; re-import candidates and expect that old exits may change.
 - Supplier extraction is configurable, but credentialed gateways, supplier sticky-session mapping and uncontrolled rotating exits are not implemented. Rola requires an actual account-specific extraction contract; no endpoint was invented.
