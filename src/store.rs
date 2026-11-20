@@ -111,11 +111,11 @@ impl Database {
             {
                 std::fs::create_dir_all(parent).context("cannot create database directory")?;
             }
-            // Unix flock is independent of SQLite's fcntl locks: lock the database inode,
-            // not a removable sidecar. Windows byte locks would block SQLite itself.
-            #[cfg(unix)]
+            // Linux flock is independent of SQLite fcntl locks. Darwin's lock domains
+            // interact on the database inode, so macOS (like Windows) uses a sidecar.
+            #[cfg(target_os = "linux")]
             let lock_name = config.database.clone();
-            #[cfg(not(unix))]
+            #[cfg(not(target_os = "linux"))]
             let lock_name = {
                 let path = std::fs::canonicalize(&config.database)
                     .unwrap_or_else(|_| config.database.clone());
