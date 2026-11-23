@@ -97,7 +97,7 @@ pub fn validate_rendered(config: &Value, server_config: &str, providers: &str) -
             .iter()
             .find(|v| v["target"] == target)
             .context("required mounted config missing")?;
-        ensure!(volume["type"] == "bind" && volume["read_only"] == true && volume["bind"]["create_host_path"] == false && volume["source"].as_str().is_some_and(|p| normalized(p) == normalized(source)), "configuration must bind the existing owned file read-only, without creating missing host paths");
+        ensure!(volume["type"] == "bind" && volume["read_only"] == true && does_not_create_host_path(volume) && volume["source"].as_str().is_some_and(|p| normalized(p) == normalized(source)), "configuration must bind the existing owned file read-only, without creating missing host paths");
     }
     ensure!(
         volumes
@@ -143,6 +143,21 @@ pub fn validate_rendered(config: &Value, server_config: &str, providers: &str) -
         "network must be owned by the random smoke project"
     );
     Ok(())
+}
+
+fn does_not_create_host_path(volume: &Value) -> bool {
+    // Compose v2 omits false bind options in normalized JSON. The zero value
+    // still uses the mount API without creating a missing host path.
+    let Some(bind) = volume.get("bind") else {
+        return true;
+    };
+    let Some(bind) = bind.as_object() else {
+        return false;
+    };
+    matches!(
+        bind.get("create_host_path"),
+        None | Some(Value::Bool(false))
+    )
 }
 
 fn empty(value: &Value) -> bool {
@@ -448,7 +463,7 @@ impl<'a, R: Runner> Smoke<'a, R> {
         ensure!(
             bind["type"] == "bind"
                 && bind["read_only"] == true
-                && bind["bind"]["create_host_path"] == false
+                && does_not_create_host_path(&bind)
                 && bind["source"]
                     .as_str()
                     .is_some_and(|p| normalized(p) == path_string(&certs)),

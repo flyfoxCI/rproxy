@@ -107,6 +107,14 @@ fn smoke_checks_real_rendered_host_ports_https_binds_and_missing_root_token_befo
                 let volumes = &mut model["services"]["rproxy"]["volumes"];
                 volumes[0]["source"] = json!(request.env["RPROXY_CONFIG"]);
                 volumes[1]["source"] = json!(request.env["RPROXY_PROVIDERS_ENV"]);
+                if self.corrupt == "omitted-false" {
+                    for volume in volumes.as_array_mut().unwrap().iter_mut().take(2) {
+                        volume["bind"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("create_host_path");
+                    }
+                }
                 model["services"]["rproxy"]["ports"][0]["published"] =
                     json!(request.env["RPROXY_HTTP_PORT"]);
                 model["services"]["rproxy"]["ports"][1]["published"] =
@@ -117,7 +125,17 @@ fn smoke_checks_real_rendered_host_ports_https_binds_and_missing_root_token_befo
                 if https {
                     assert!(std::path::Path::new(&request.env["RPROXY_CERTS_DIR"]).is_dir());
                     model["services"]["rproxy"]["ports"].as_array_mut().unwrap().push(json!({"host_ip":"127.0.0.1","target":9443,"published":request.env["RPROXY_HTTPS_PORT"]}));
-                    model["services"]["rproxy"]["volumes"].as_array_mut().unwrap().push(json!({"type":"bind","target":"/etc/rproxy/certs","source":request.env["RPROXY_CERTS_DIR"],"read_only": self.corrupt != "https-bind", "bind":{"create_host_path":false}}));
+                    let mut certificate = json!({"type":"bind","target":"/etc/rproxy/certs","source":request.env["RPROXY_CERTS_DIR"],"read_only": self.corrupt != "https-bind", "bind":{"create_host_path":false}});
+                    if self.corrupt == "omitted-false" {
+                        certificate["bind"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("create_host_path");
+                    }
+                    model["services"]["rproxy"]["volumes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(certificate);
                 }
                 model.to_string()
             } else {
@@ -137,7 +155,14 @@ fn smoke_checks_real_rendered_host_ports_https_binds_and_missing_root_token_befo
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap();
-    for corrupt in ["", "host-port", "https-bind", "named-volume", "cleanup"] {
+    for corrupt in [
+        "",
+        "omitted-false",
+        "host-port",
+        "https-bind",
+        "named-volume",
+        "cleanup",
+    ] {
         let mut runner = RenderEngine {
             requests: vec![],
             corrupt,
@@ -153,7 +178,7 @@ fn smoke_checks_real_rendered_host_ports_https_binds_and_missing_root_token_befo
         )
         .unwrap_err();
         let diagnostic = format!("{error:#}");
-        if corrupt.is_empty() || corrupt == "cleanup" {
+        if matches!(corrupt, "" | "omitted-false" | "cleanup") {
             assert!(diagnostic.contains("exit code: 19"));
             assert_eq!(diagnostic.contains("cleanup failed"), corrupt == "cleanup");
             let cleanup = runner.requests.last().unwrap();
@@ -195,6 +220,40 @@ fn smoke_checks_real_rendered_host_ports_https_binds_and_missing_root_token_befo
 }
 
 #[test]
+fn rendered_smoke_accepts_omitted_false_bind_options() {
+    for omission in ["field", "options", "empty-options"] {
+        let mut config = rendered();
+        for volume in config["services"]["rproxy"]["volumes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .filter(|volume| volume["type"] == "bind")
+        {
+            match omission {
+                "field" => {
+                    volume["bind"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("create_host_path");
+                    volume["bind"]["selinux"] = json!("Z");
+                }
+                "options" => {
+                    volume.as_object_mut().unwrap().remove("bind");
+                }
+                "empty-options" => volume["bind"] = json!({}),
+                _ => unreachable!(),
+            }
+        }
+        validate_rendered(
+            &config,
+            "/temporary/rproxy.toml",
+            "/temporary/providers.env",
+        )
+        .unwrap_or_else(|error| panic!("rejected Compose omitted-false form {omission}: {error}"));
+    }
+}
+
+#[test]
 fn rendered_smoke_requires_only_one_production_service_and_readonly_existing_config_binds() {
     validate_rendered(
         &rendered(),
@@ -207,6 +266,9 @@ fn rendered_smoke_requires_only_one_production_service_and_readonly_existing_con
         "secret",
         "writable",
         "create",
+        "create-null",
+        "create-string",
+        "bind-null",
         "missing",
         "path",
         "fixture",
@@ -243,6 +305,17 @@ fn rendered_smoke_requires_only_one_production_service_and_readonly_existing_con
             "create" => {
                 config["services"]["rproxy"]["volumes"][0]["bind"]["create_host_path"] =
                     json!(true);
+            }
+            "create-null" => {
+                config["services"]["rproxy"]["volumes"][0]["bind"]["create_host_path"] =
+                    Value::Null;
+            }
+            "create-string" => {
+                config["services"]["rproxy"]["volumes"][0]["bind"]["create_host_path"] =
+                    json!("false");
+            }
+            "bind-null" => {
+                config["services"]["rproxy"]["volumes"][0]["bind"] = Value::Null;
             }
             "missing" => {
                 config["services"]["rproxy"]["volumes"]

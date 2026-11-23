@@ -76,6 +76,8 @@ The production Compose contract is one `rproxy` service with:
 - `providers.env` read by the internal collector through `[collector].env_file`, **not** injected using Compose `env_file` or general process environment.
 - A persistent project-owned volume at `/var/lib/rproxy`, with no external or custom-named resources.
 
+Normalized Compose v2 JSON may omit false-valued `bind.create_host_path` options; the validator accepts that default-false representation as well as explicit `false`, but rejects `true` and malformed values. The runtime missing-config check still requires that no host path is created.
+
 Before starting containers, the tool validates effective configuration, host-port overrides, and empty-root-token rejection. It also **renders only** `compose.https.yaml` using an existing owned temporary certificate directory, checking preservation of HTTP/SOCKS ports, the HTTPS port override and read-only certificate bind. No TLS container is started and no private certificate is required for this render check.
 
 Runtime smoke exercises:
