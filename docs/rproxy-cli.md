@@ -1,4 +1,4 @@
-# rproxy-cli (v0.2.3)
+# rproxy-cli (v0.2.4)
 
 `rproxy-cli` administers a running rproxy through its authenticated management API.
 It does not read the server TOML, open SQLite, or require a restart. The separate
@@ -31,7 +31,7 @@ Global options can appear before or after the command:
 
 The client first checks `/v1/info`, requires `management_version: 1`, and checks the
 command group's advertised capability. It never falls back to editing a database.
-Use the root token, not `RPROXY_WORKER_TOKEN`; collector access is a separate role.
+Use the root token. In0.2.4 collection runs inside rproxy; the former worker token and external collector HTTP routes are no longer accepted.
 A missing token, incompatible server, rejected mutation, failed admission, or wait
 timeout exits nonzero. Invalid CLI arguments exit 2. Errors withhold HTTP bodies,
 transport details, password values, bearer values, and import parser contents.
@@ -81,7 +81,7 @@ not patch or delete it. Re-enabling does not revive revoked streams.
 
 ```sh
 rproxy-cli source import sources.toml
-rproxy-cli source import - < sources.toml # Also works through docker compose exec -T.
+rproxy-cli source import - < sources.toml # Also works through docker exec -i.
 rproxy-cli source import sources.toml --replace
 rproxy-cli source list
 rproxy-cli source show vendor
@@ -98,7 +98,8 @@ rproxy-cli source export --include-secrets --output private-sources.json --yes
 Imports accept the old collector `[[providers]]` format, new `[[sources]]` TOML,
 or JSON `{ "schema_version": 1, "sources": [...] }`. Legacy provider fields become
 `config`; name/enabled/kind are source metadata. Environment references such as
-`${SUPPLIER_URL}` are preserved literally for the worker to resolve. Source files
+`${SUPPLIER_URL}` are preserved literally for the internal Rust collector to
+resolve from its dedicated `collector.env_file`, never the process environment. Source files
 are parsed locally, not executed. All entries are validated before the first
 mutation; subsequent server failures can still leave earlier entries saved, so
 inspect the list before retrying.

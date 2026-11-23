@@ -111,6 +111,9 @@ impl Router {
     pub fn shutdown(&self) {
         self.shutdown.send_replace(true);
     }
+    pub(crate) fn shutdown_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
 
     pub async fn reserve(
         &self,

@@ -1,7 +1,5 @@
 use super::*;
-use crate::managed_types::{
-    AdminRelease, CollectorResult, ProxyAction, SourceChange, SourceInput, UserChange,
-};
+use crate::managed_types::{AdminRelease, ProxyAction, SourceChange, SourceInput, UserChange};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 
@@ -172,21 +170,6 @@ async fn route(
             Some(view) => response(StatusCode::OK, serde_json::to_value(view)?),
             None => error(StatusCode::NOT_FOUND, "source not found"),
         }));
-    }
-    if method == Method::GET && path == "/v1/collector/plan" {
-        return Ok(Some(response(
-            StatusCode::OK,
-            serde_json::to_value(store.collector_plan().await?)?,
-        )));
-    }
-    if method == Method::POST && path == "/v1/collector/results" {
-        let accepted = store
-            .collector_result(decode::<CollectorResult>(body)?)
-            .await?;
-        return Ok(Some(response(
-            StatusCode::ACCEPTED,
-            json!({"accepted":accepted}),
-        )));
     }
     if method == Method::GET && path == "/v1/proxies" {
         let mut items = store.proxy_views().await?;

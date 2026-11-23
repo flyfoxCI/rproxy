@@ -1,6 +1,6 @@
 # Import explicitly with: rproxy-cli source import sources.toml
 # Copy to sources.toml, keep only the sources you use, then supply provider env vars
-# to the collector (scripts/providers.env in Compose). This file is NOT auto-loaded.
+# in providers.env (collector.env_file). This file is NOT auto-loaded.
 schema_version = 1
 
 [[sources]]

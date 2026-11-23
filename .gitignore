@@ -13,6 +13,9 @@
 *.pem
 *.key
 /sources.toml
+/providers.env
+/xtask/target/
+/xtask/Cargo.lock
 /private-sources.*
 /sources-private.*
 __pycache__/

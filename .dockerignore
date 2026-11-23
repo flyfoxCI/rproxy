@@ -4,6 +4,8 @@
 !Cargo.lock
 !src/
 !src/**
-!scripts/
-!scripts/collector.py
-!scripts/requirements.txt
+!xtask/
+xtask/*
+!xtask/Cargo.toml
+!xtask/src/
+!xtask/src/**

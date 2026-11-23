@@ -1,123 +1,114 @@
-# Collector worker (v0.2.3)
+# 内置配置化采集（0.2.4）
 
-The Python collector is an acquisition worker. Rust stores and manages sources, validates results, and owns proxy admission, verification and routing. Updating a source does not require restarting the collector. The worker never opens SQLite and never calls root user, source, proxy or session management routes.
+采集已并入 `rproxy` 的 Tokio 异步任务；不再需要外部 worker、独立令牌或语言运行时。`rproxy-cli` 管理来源，SQLite 保存加密配置，内置采集器通过 typed Store 接口提交候选。网络请求不在数据库状态线程内执行。
 
-## Bootstrap and credentials
+## 启动配置
 
-Requires Python 3.11+ and the existing `requests[socks]` and `certifi` dependencies. Copy `scripts/proxy.example.toml` to your bootstrap location:
+在服务端 `rproxy.toml` 添加：
 
 ```toml
-workers = 4
-poll_seconds = 3
-
-[rproxy]
-url = "http://127.0.0.1:9100"
-token_env = "RPROXY_WORKER_TOKEN"
-timeout_seconds = 15
-# ca_certificate = "certs/rproxy-ca.pem"
+[collector]
+enabled = true
+concurrency = 4       # 1..64
+poll_seconds = 3      # 1..300
+# 相对服务端 TOML 目录；不配置时变量映射为空。
+env_file = "providers.env"
 ```
 
-Supply the **worker** bearer through `RPROXY_WORKER_TOKEN` (or the environment variable named by `token_env`). Root management uses a separate `RPROXY_ADMIN_TOKEN`; do not give it to the worker. Never put either token in command arguments or source files. Set the independent worker token on the Rust server as well. Worker access is disabled when the server has no worker token configured.
+复制根目录 `providers.env.example` 为 `providers.env`，只放供应商需要的 UTF-8 `KEY=VALUE`：
 
-Use an internal trusted network, verified HTTPS, or an SSH tunnel. Do not expose an unauthenticated or plaintext management listener publicly. Management HTTPS always validates certificates; there is no management `insecure` option. Client sessions ignore environment proxy/netrc settings, never follow redirects, and do not forward the worker bearer to suppliers.
+```dotenv
+SUPPLIER_API_URL=https://your-provider.example/extract
+SUPPLIER_API_TOKEN=your-private-token
+```
+
+支持空行、注释、可选引号，不执行 shell，不做进程变量展开。文件最多1MiB。**`${ENV}` 只读取该文件，绝不回退到进程环境**；不要把 root token、`RPROXY_SOURCE_KEY` 或入口密码放进它。更改文件/启动设置需要重启原生进程或重新创建容器；来源定义在线更新无需重启。
+
+可选 Docker 部署用 `--mount` 将供应商文件只读挂载为 `/etc/rproxy/providers.env`，不是进程环境注入；只运行一个生产容器，不需要编排工具。使用示例配置时，空池也应保留空文件。禁用内置采集不影响手动添加候选或代理验证/转发。
+
+## 在线来源管理
 
 ```sh
-python scripts/collector.py --config scripts/proxy.toml --check-config
-python scripts/collector.py --config scripts/proxy.toml
-python scripts/collector.py --config scripts/proxy.toml --once
+cp sources.example.toml sources.toml
+# 编辑后从宿主标准输入导入：
+docker exec -i rproxy rproxy-cli source import - < sources.toml
+docker exec -i rproxy rproxy-cli source list
+docker exec -i rproxy rproxy-cli source resume vendor-a
+docker exec -i rproxy rproxy-cli source run vendor-a --wait --wait-timeout 60
+docker exec -i rproxy rproxy-cli source pause vendor-a
 ```
 
-- `--check-config` validates only the bootstrap, without a token or HTTP request. It does not validate live source definitions or supplier credentials.
-- Normal execution and `--once` require the worker token even when there are no sources. An empty plan leaves normal execution alive and polling.
-- `--once` fetches one plan, runs every returned source once with bounded concurrency, and exits. Success (including zero sources/addresses) is exit code 0; plan, source, submission or authorization failures give a nonzero exit. Successful sources still submit if another source fails. Counts mean accepted candidates, **not verified proxies**.
-- Invalid bootstrap fields, malformed TOML and missing bootstrap environment references fail startup. A temporarily unavailable server is retried on the poll interval in normal execution, not by a tight retry loop. HTTP 401/403 requires an operator fix and terminates the worker. One-shot mode does not retry a failed management request.
+支持 `[[sources]]`、旧 `[[providers]]` TOML 和 JSON。来源仅通过显式导入进入 SQLite，不自动把文件当作第二份运行权威；普通查询/导出脱敏。来源 ID 不随重命名/同名重建复用。暂停/删除停止未来采集，默认不撤销已有代理和 stick。
 
-`workers` is an integer from 1 to 32; `poll_seconds` from 1 to 300 (default 3); management timeout from 1 to 300 seconds (default 15). Relative CA paths, including those in received sources, resolve against the **bootstrap file's directory**, not the current working directory. Bootstrap changes themselves require restarting the process.
+## 通用映射
 
-## Explicit source import
-
-A nonempty `[[providers]]` array in bootstrap TOML now fails with an explicit `rproxy-cli source import` instruction, even if every provider is disabled. An empty legacy `providers = []` is harmless. This prevents two runtime authorities.
-
-1. Keep the old provider file as an **import manifest**, separate from the new bootstrap. Protect it if it contains literal credentials.
-2. Review `rproxy-cli source import --help`, then explicitly import that manifest using the root CLI. Source import accepts legacy `[[providers]]` files and `[[sources]]` manifests. Import is never performed automatically by the collector.
-3. Give the worker the environment variables referenced by the imported definitions. Restart the worker only if its process environment needs to change.
-4. Use `rproxy-cli source list/show/pause/resume/run/remove` to manage the server's source state online. Pause/removal stop future acquisition; they do not implicitly withdraw existing pool members.
-
-### Generic provider mapping examples
-
-These belong in a separate legacy import manifest, **not** in the collector bootstrap. Use your supplier's documented URL/schema; no supplier endpoint is assumed. Environment references are preserved by server storage and resolved only on the worker for each run.
+以下是独立来源导入 manifest，不是服务端 TOML：
 
 ```toml
-[[providers]]
+schema_version = 1
+
+[[sources]]
 name = "text-provider"
+kind = "api"
+enabled = true
+[sources.config]
 url = "${SUPPLIER_API_URL}"
 protocol = "http"
 method = "GET"
 interval_seconds = 60
 timeout_seconds = 10
 attempts = 3
-[providers.params]
+[sources.config.params]
 count = 10
-[providers.headers]
+[sources.config.headers]
 Authorization = "Bearer ${SUPPLIER_API_TOKEN}"
-[providers.response]
+[sources.config.response]
 format = "text"
+```
 
-[[providers]]
+JSON 示例：
+
+```toml
+[[sources]]
 name = "json-provider"
+kind = "api"
+enabled = false
+[sources.config]
 url = "${JSON_PROVIDER_API_URL}"
 protocol = "socks5"
 method = "POST"
-[providers.json]
+[sources.config.json]
 count = 1
-[providers.response]
+[sources.config.response]
 format = "json"
 items_path = "data.proxies"
 address_path = "endpoint"
+# 或同时配置 ip_path="ip" 和 port_path="port"。
+# 可同时配置 success_path="code" / success_value=0，要求精确 JSON 值。
 ```
 
-Text responses are separated by whitespace, commas or semicolons. JSON mapping supports dot paths and numeric array indices. Instead of `address_path`, set both `ip_path` and `port_path` to read separate fields. `success_path` and `success_value` can be configured together to require an exact JSON value before extracting items. Empty paths address the current object. Results must contain numeric IP:port addresses (IPv6 is bracketed); hostnames, embedded credentials, invalid ports, unspecified and scoped addresses are rejected. Duplicates are normalized and removed.
+文本按空白、逗号、分号分隔。JSON 路径支持点号和数字数组下标，空路径指当前值。只接受数字 IPv4/IPv6 和合法端口，IPv6 地址端点需 `[address]:port`；拒绝域名、嵌入凭据、未指定地址和 scoped IPv6，规范化后去重。
 
-Source fields retain the existing generic GET/POST behavior: `url`, `protocol`, `method`, `params`, `headers`, `json`, `response`, `interval_seconds`, `timeout_seconds`, `attempts`, optional `ca_certificate` and explicit supplier-only `insecure`. GET cannot have a JSON body. Defaults are HTTP, GET, text response, a 60-second interval, 10-second timeout and 3 attempts. Limits are 86400 seconds per interval, 300 seconds per timeout and 5 attempts. Mapping failures are not retried; transport/status/size failures use the bounded attempts with short backoff. Missing `${ENV}` values produce `env-missing` without revealing the variable name or value.
+GET 不带 JSON 请求体；只支持 GET/POST 和 http/socks5 上游，不执行脚本/签名。默认60秒间隔、10秒请求预算、3次尝试；上限86400秒间隔、300秒请求预算、5次尝试。每次尝试的超时覆盖响应体读取，不让慢速滴流无限延长。映射错误不重试；传输/状态/尺寸失败使用有界重试和退避。
 
-There is no executable mapping, invented Rola API URL, credentialed rotating gateway, or supplier sticky-session parameter support. Entry credentials are not upstream credentials.
+供应商响应按**解压后1MiB**限制，每次最多提取4096个地址；每批最多256个候选，最后一批才标记完成，空成功结果也会完成。禁止重定向和 ambient proxy；默认验证 TLS。可选 `ca_certificate` 相对服务端 TOML，`insecure=true` 仅为明确的供应商证书例外，不影响目标 TLS 隧道。
 
-## Versioned HTTP contract and scheduling
+Xdaili/Shenlong 等使用当前账户文档填写 URL/字段；不为 Rola 编造接口，不声称认证旋转网关或供应商 sticky-session 参数已支持。
 
-Every management call uses `Authorization: Bearer <worker token>`.
+## 调度与安全边界
 
-```text
-GET /v1/collector/plan
-{
-  "version": "0.2.3",
-  "sources": [{
-    "id": "s_...", "name": "source-name", "version": 1, "run_generation": 0,
-    "config": {"name": "source-name", "protocol": "http", "url": "..."}
-  }]
-}
-```
+只调度启用且未删除的 API 来源；单来源最多一个当前任务，全局并发有界，无无限排队。来源版本或手动 run generation 更新后及时重新调度；暂停、删除、修改和服务关闭会取消/丢弃旧工作。每批结果仍由 Store 原子核对来源 ID、启用状态、版本和 generation，迟到旧结果不能复活配置。
 
-The plan contains **enabled API sources only**. The collector polls independently of source intervals, applies additions/edits/removals without restarting, and schedules new revisions or manual `run_generation` changes immediately when capacity is available. There is at most one in-flight fetch/submission per immutable source ID; an updated run waits for any old run to finish. Normal periodic runs wait `interval_seconds` after completion. The executor does not accumulate an obsolete job backlog.
+来源失败彼此隔离，不影响其他来源或业务转发。安全状态只有 `env-missing`、`mapping-failed`、`fetch-failed`，不回显 URL、参数、请求头/体或秘密。采集成功表示提交候选，不表示实际出口验证通过；继续使用 CLI proxy list/show/verify 查询。
 
-```text
-POST /v1/collector/results
-{
-  "source_id": "s_...", "version": 1, "run_generation": 0,
-  "addresses": ["1.2.3.4:80"], "complete": true, "error": null
-}
--> 202 {"accepted": 1}
-```
+外部 `/v1/collector/plan` / `/v1/collector/results` 已移除。旧 `admin.worker_token_env` 只兼容解析，不能认证任何请求；管理接口只接受 root token，不能通过重启旧 worker恢复采集。
 
-Results contain **no protocol field**; the server uses the stored source protocol. Each batch contains at most 256 addresses. Only the final batch has `complete: true`; empty successful runs still submit one complete result. Failures submit an empty complete result with exactly one of `fetch-failed`, `mapping-failed`, or `env-missing`. An HTTP 409 stops remaining batches and suppresses that stale revision/generation until a new one appears; it is never retried. Other submission failures wait until the normal interval, rather than replaying a possibly partially accepted job immediately.
+## 从旧 worker 迁移
 
-The server must atomically check source ID, enabled/deleted state, revision and generation before accepting **every** batch or status update. Worker access to root routes must return 403; this is enforced by the server, not by Python. Old in-flight work can finish after pause/edit/remove and is expected to receive 409. No request queue or lease platform is needed; deploy one collector per source plan to avoid duplicate acquisitions by independent collector processes.
+1. 停止并备份原部署的整个状态目录和密钥；Docker 迁移保留原实际卷名，包括旧编排部署可能使用的项目名前缀。
+2. 服务端添加 `[collector]`；将原供应商变量迁移到专用 `providers.env`。
+3. 保留 SQLite 中已管理来源，无需重复导入。0.2.2旧 provider manifest 可用 CLI显式导入。
+4. 移除 worker token 和旧 `scripts/proxy.toml` 启动引用；确认所有权后停止自己的旧 worker。可用原生服务或直接 docker run 启动单个 rproxy 容器，沿用状态卷；不删除数据卷或无关资源。
+5. `source run --wait` / `proxy list` 检查任务及候选验证结果。
 
-Provider and plan bodies are capped at 1 MiB; plans contain at most 1000 sources. Provider extraction is capped at 4096 addresses per run. Result acknowledgements are capped at 64 KiB. Requests have finite timeouts and streamed reads check size/deadline limits. A failed or invalid plan leaves the last valid schedule in place; the server's stale-result checks remain authoritative during outages. Logs contain validated immutable IDs, counts and safe categories, never source names, URLs, query strings, headers, bodies or tokens.
-
-## Local tests
-
-```sh
-python -m unittest discover -s scripts/tests -v
-```
-
-Tests use only the standard library and local fake HTTP servers. They cover online changes/manual generations, one-in-flight scheduling, empty/batched results, stale suppression, role rejection, idle/one-shot operation, environment resolution, mapping, address validation and bounded safe errors. They do not call real suppliers or substitute for Rust authorization and atomic stale-result integration tests.
+更详细的实现和本地测试证据见 [internal-collector.md](internal-collector.md)。

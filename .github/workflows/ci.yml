@@ -17,41 +17,74 @@ permissions:
 
 jobs:
   test:
-    name: Tests and lint
-    runs-on: ubuntu-22.04
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 16379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-    env:
-      RPROXY_TEST_REDIS: redis://127.0.0.1:16379/
+    name: Tests and lint (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
       - name: Prepare Rust
         run: |
           rustup update stable
           rustup default stable
           rustup component add rustfmt clippy
-      - name: Install Python dependencies
-        run: python -m pip install -r scripts/requirements.txt
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: Check lint
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Test Rust
-        run: cargo test --locked --all-targets
-      - name: Test Python maintenance
-        run: python -m unittest discover -s scripts/tests -v
-      - name: Test release packaging
-        run: python -m unittest discover -s scripts/release_tests -v
+        run: cargo clippy --locked --workspace --all-targets --jobs 1 -- -D warnings
+      - name: Test Rust workspace
+        run: cargo test --locked --workspace --all-targets --jobs 1
+
+  docker:
+    name: Docker image check
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Build the single production image
+        run: docker build --tag rproxy-ci .
+      - name: Check both packaged programs without network access
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges rproxy-ci --version
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint rproxy-cli rproxy-ci --version
+      - name: Start one offline container and exercise its management CLI
+        shell: bash
+        run: |
+          configuration="$(mktemp -d)"
+          cp rproxy.example.toml "$configuration/rproxy.toml"
+          cp providers.env.example "$configuration/providers.env"
+          export RPROXY_ADMIN_TOKEN="$(openssl rand -hex 32)"
+          export RPROXY_PASSWORD="$(openssl rand -hex 24)"
+          container=""
+          cleanup() {
+            if [[ -n "$container" ]]; then
+              docker rm --force --volumes "$container"
+            fi
+            rm -rf "$configuration"
+          }
+          trap cleanup EXIT
+          container="$(docker run -d --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --env RPROXY_ADMIN_TOKEN --env RPROXY_PASSWORD \
+            --mount "type=bind,src=$configuration/rproxy.toml,dst=/etc/rproxy/rproxy.toml,readonly" \
+            --mount "type=bind,src=$configuration/providers.env,dst=/etc/rproxy/providers.env,readonly" \
+            --volume /var/lib/rproxy rproxy-ci)"
+          ready=false
+          for attempt in {1..30}; do
+            if docker exec "$container" rproxy-cli health; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs --tail 100 "$container"
+            exit 1
+          fi
+          printf '%s\n' "$RPROXY_PASSWORD" | docker exec -i "$container" rproxy-cli user add docker-smoke --business shop --password-stdin
+          docker exec "$container" rproxy-cli user show docker-smoke

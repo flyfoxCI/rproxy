@@ -93,7 +93,7 @@ async fn root_user_management_is_live_and_worker_cannot_access_root_routes() {
         request(&url, "GET", "/v1/info", "worker-test-token-1234", None)
             .await
             .0,
-        403
+        401
     );
     assert_eq!(request(&url, "GET", "/v1/users", "", None).await.0, 401);
     let (status, user) = request(
@@ -175,28 +175,41 @@ async fn source_role_version_and_protocol_are_enforced_at_candidate_commit() {
         paused.0, 201,
         "paused source must be created atomically, not enabled then patched later"
     );
-    let (status, plan) = request(
-        &url,
-        "GET",
-        "/v1/collector/plan",
-        "worker-test-token-1234",
-        None,
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(plan["sources"][0]["config"]["protocol"], "socks5");
-    let result = json!({"source_id":source["id"],"version":source["version"],"run_generation":source["run_generation"],"addresses":["127.0.0.1:1080"],"complete":true,"error":null});
     assert_eq!(
         request(
             &url,
-            "POST",
-            "/v1/collector/results",
+            "GET",
+            "/v1/collector/plan",
             "worker-test-token-1234",
-            Some(result.clone())
+            None
         )
         .await
         .0,
-        202
+        401
+    );
+    assert_eq!(
+        request(
+            &url,
+            "GET",
+            "/v1/collector/plan",
+            "root-test-token-1234",
+            None
+        )
+        .await
+        .0,
+        404
+    );
+    let plan = serde_json::to_value(state.router.store.collector_plan().await.unwrap()).unwrap();
+    assert_eq!(plan["sources"][0]["config"]["protocol"], "socks5");
+    let result = json!({"source_id":source["id"],"version":source["version"],"run_generation":source["run_generation"],"addresses":["127.0.0.1:1080"],"complete":true,"error":null});
+    assert_eq!(
+        state
+            .router
+            .store
+            .collector_result(serde_json::from_value(result.clone()).unwrap())
+            .await
+            .unwrap(),
+        1
     );
     assert_eq!(
         state.router.store.candidates().await.unwrap()[0].protocol,
@@ -214,18 +227,12 @@ async fn source_role_version_and_protocol_are_enforced_at_candidate_commit() {
         .0,
         200
     );
-    assert_eq!(
-        request(
-            &url,
-            "POST",
-            "/v1/collector/results",
-            "worker-test-token-1234",
-            Some(result)
-        )
+    assert!(state
+        .router
+        .store
+        .collector_result(serde_json::from_value(result).unwrap())
         .await
-        .0,
-        409
-    );
+        .is_err());
     assert_eq!(
         request(
             &url,
@@ -236,7 +243,7 @@ async fn source_role_version_and_protocol_are_enforced_at_candidate_commit() {
         )
         .await
         .0,
-        403
+        401
     );
 }
 #[tokio::test]

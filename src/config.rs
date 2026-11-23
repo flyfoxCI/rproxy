@@ -21,6 +21,7 @@ pub struct Config {
     pub auth: AuthConfig,
     pub routing: RoutingConfig,
     pub probe: ProbeConfig,
+    pub collector: CollectorConfig,
 }
 
 impl Default for Config {
@@ -36,6 +37,29 @@ impl Default for Config {
             auth: AuthConfig::default(),
             routing: RoutingConfig::default(),
             probe: ProbeConfig::default(),
+            collector: CollectorConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorConfig {
+    pub enabled: bool,
+    pub concurrency: usize,
+    pub poll_seconds: u64,
+    pub env_file: Option<PathBuf>,
+    #[serde(skip)]
+    pub base_directory: PathBuf,
+}
+impl Default for CollectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            concurrency: 4,
+            poll_seconds: 3,
+            env_file: None,
+            base_directory: ".".into(),
         }
     }
 }
@@ -46,6 +70,7 @@ pub struct AdminConfig {
     pub enabled: bool,
     pub bind: SocketAddr,
     pub token_env: String,
+    // Accepted for old configuration files only; external collectors no longer authenticate.
     pub worker_token_env: String,
 }
 impl Default for AdminConfig {
@@ -202,6 +227,18 @@ impl Config {
                 *ca = directory.join(&*ca);
             }
         }
+        config.collector.base_directory = if directory.is_absolute() {
+            directory.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .context("cannot resolve configuration directory")?
+                .join(directory)
+        };
+        if let Some(file) = &mut config.collector.env_file {
+            if file.is_relative() {
+                *file = config.collector.base_directory.join(&*file);
+            }
+        }
         Ok(config)
     }
     pub fn resolve_secrets(&mut self) -> Result<()> {
@@ -217,6 +254,13 @@ impl Config {
         self.validate()
     }
     pub fn validate(&self) -> Result<()> {
+        if self.collector.concurrency == 0
+            || self.collector.concurrency > 64
+            || self.collector.poll_seconds == 0
+            || self.collector.poll_seconds > 300
+        {
+            bail!("collector concurrency must be 1..64 and poll_seconds 1..300");
+        }
         if self.database.as_os_str().is_empty() || self.max_proxies == 0 {
             bail!("database path and positive max_proxies are required");
         }

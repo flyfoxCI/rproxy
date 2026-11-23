@@ -43,19 +43,6 @@ pub fn token(config: &Config) -> Result<String> {
     validate_token(&value)?;
     Ok(value)
 }
-pub fn worker_token(config: &Config, root: &str) -> Result<Option<String>> {
-    let Some(value) = std::env::var_os(&config.admin.worker_token_env) else {
-        return Ok(None);
-    };
-    let value = value
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("worker token is not valid UTF-8"))?;
-    validate_token(&value)?;
-    if equal(root, &value) {
-        bail!("root and worker tokens must be different");
-    }
-    Ok(Some(value))
-}
 fn equal(left: &str, right: &str) -> bool {
     bool::from(Sha256::digest(left.as_bytes()).ct_eq(&Sha256::digest(right.as_bytes())))
 }
@@ -75,7 +62,6 @@ async fn handle(
     mut request: Request<Incoming>,
     state: Arc<State>,
     root: Arc<String>,
-    worker: Option<Arc<String>>,
 ) -> Response<Full<Bytes>> {
     let headers: Vec<_> = request.headers().get_all("authorization").iter().collect();
     let supplied = if headers.len() == 1 {
@@ -87,9 +73,7 @@ async fn handle(
         None
     };
     let is_root = supplied.is_some_and(|value| equal(value, &root));
-    let is_worker =
-        supplied.is_some_and(|value| worker.as_ref().is_some_and(|token| equal(value, token)));
-    if !is_root && !is_worker {
+    if !is_root {
         return error(
             StatusCode::UNAUTHORIZED,
             "management authentication required",
@@ -98,15 +82,6 @@ async fn handle(
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let query = request.uri().query().unwrap_or("").to_owned();
-    if !is_root
-        && !((method == Method::GET && path == "/v1/collector/plan")
-            || (method == Method::POST && path == "/v1/collector/results"))
-    {
-        return error(
-            StatusCode::FORBIDDEN,
-            "worker credential cannot access root management",
-        );
-    }
     if method == Method::GET && matches!(path.as_str(), "/health" | "/v1/status") {
         return match state.router.store.status().await {
             Ok(status) => response(StatusCode::OK, serde_json::to_value(status).unwrap()),
@@ -221,13 +196,12 @@ pub async fn serve_scoped(
     stream: TcpStream,
     state: Arc<State>,
     root: Arc<String>,
-    worker: Option<Arc<String>>,
+    _legacy_worker: Option<Arc<String>>,
 ) -> Result<()> {
     let service = service_fn(move |request| {
         let state = state.clone();
         let root = root.clone();
-        let worker = worker.clone();
-        async move { Ok::<_, Infallible>(handle(request, state, root, worker).await) }
+        async move { Ok::<_, Infallible>(handle(request, state, root).await) }
     });
     hyper::server::conn::http1::Builder::new()
         .keep_alive(false)

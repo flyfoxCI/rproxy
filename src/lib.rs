@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod args;
 pub mod auth;
+pub mod collector;
 pub mod config;
 pub mod control_client;
 pub mod http;
