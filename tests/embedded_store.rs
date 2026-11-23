@@ -128,7 +128,8 @@ async fn corrupt_persisted_binding_fails_closed() {
     }
 }
 
-#[cfg(unix)]
+// Linux uses the database inode. macOS/Windows use a sidecar which must not be removed.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn removing_sidecar_cannot_bypass_database_owner() {
     let directory = tempfile::tempdir().unwrap();
@@ -143,6 +144,27 @@ async fn removing_sidecar_cannot_bypass_database_owner() {
         "deleting sidecar allowed a second owner"
     );
     store.status().await.unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_ownership_guard_allows_sqlite_commits_but_rejects_second_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        database: directory.path().join("state.sqlite3"),
+        ..Config::default()
+    };
+    let store = Store::open(&config).await.unwrap();
+    store
+        .create_user(
+            "owner".into(),
+            "test-password".into(),
+            vec!["storage".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.users().await.unwrap().len(), 1);
+    assert!(Store::open(&config).await.is_err());
 }
 
 #[tokio::test]

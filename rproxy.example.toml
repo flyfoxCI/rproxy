@@ -10,7 +10,12 @@ socks5_bind = "127.0.0.1:9089"
 enabled = true
 bind = "127.0.0.1:9100"
 token_env = "RPROXY_ADMIN_TOKEN" # Root administration; at least 16 non-space ASCII characters.
-worker_token_env = "RPROXY_WORKER_TOKEN" # Collector only; must differ from root token.
+
+[collector]
+enabled = true
+concurrency = 4 # 1..64 simultaneous supplier requests.
+poll_seconds = 3 # 1..300; source changes/manual runs are picked up on this interval.
+env_file = "providers.env" # Relative to this TOML; private map, not process env.
 
 # [tls]
 # certificate = "certs/fullchain.pem"

@@ -86,7 +86,6 @@ pub struct Server {
     tls: Option<tokio_rustls::TlsAcceptor>,
     admin: Option<TcpListener>,
     admin_token: Option<Arc<String>>,
-    worker_token: Option<Arc<String>>,
 }
 
 impl Server {
@@ -110,10 +109,8 @@ impl Server {
         if http.is_none() && https.is_none() && socks.is_none() {
             bail!("no listeners enabled");
         }
-        let mut worker_token = None;
         let (admin, admin_token) = if state.config.admin.enabled {
             let token = crate::admin::token(&state.config)?;
-            worker_token = crate::admin::worker_token(&state.config, &token)?.map(Arc::new);
             (
                 Some(TcpListener::bind(state.config.admin.bind).await?),
                 Some(Arc::new(token)),
@@ -129,7 +126,6 @@ impl Server {
             tls,
             admin,
             admin_token,
-            worker_token,
         })
     }
     pub fn admin_address(&self) -> Option<std::net::SocketAddr> {
@@ -156,6 +152,21 @@ impl Server {
                 log::info!("listening protocol={protocol} address={address}");
             }
         }
+        let state = self.state.clone();
+        let collector = tokio::spawn(async move {
+            if crate::collector::run(
+                state.config.collector.clone(),
+                state.router.store.clone(),
+                state.router.shutdown_signal(),
+            )
+            .await
+            .is_err()
+            {
+                log::error!(
+                    "internal collection stopped; check collector configuration and provider file"
+                );
+            }
+        });
         let mut tasks = tokio::task::JoinSet::new();
         let state = self.state.clone();
         let mut changes = state.router.store.subscribe();
@@ -228,18 +239,12 @@ impl Server {
             let state = self.state.clone();
             let tls = self.tls.clone();
             let admin_token = self.admin_token.clone();
-            let worker_token = self.worker_token.clone();
             tasks.spawn(async move {
                 let _permit = permit;
                 let result = match protocol {
                     "admin" => match tokio::time::timeout(
                         Duration::from_secs(20),
-                        crate::admin::serve_scoped(
-                            stream,
-                            state,
-                            admin_token.unwrap(),
-                            worker_token,
-                        ),
+                        crate::admin::serve(stream, state, admin_token.unwrap()),
                     )
                     .await
                     {
@@ -267,6 +272,9 @@ impl Server {
         self.state.router.shutdown();
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+        if collector.await.is_err() {
+            log::error!("internal collector task failed");
+        }
         Ok(())
     }
 }

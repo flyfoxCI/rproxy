@@ -1,6 +1,11 @@
+[workspace]
+members = ["xtask"]
+default-members = ["."]
+resolver = "2"
+
 [package]
 name = "rproxy"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 default-run = "rproxy"
 
@@ -22,7 +27,7 @@ log = "0.4"
 rand = "0.8"
 fs2 = "0.4"
 rusqlite = { version = "0.37", features = ["bundled"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "gzip", "deflate", "brotli"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
@@ -36,5 +41,6 @@ toml = "0.8"
 url = "2"
 
 [dev-dependencies]
+serde_yaml = "0.9"
 tempfile = "3"
 rcgen = "0.13"

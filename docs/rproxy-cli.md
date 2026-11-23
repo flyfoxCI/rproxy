@@ -1,4 +1,4 @@
-# rproxy-cli (v0.2.3)
+# rproxy-cli (v0.2.4)
 
 `rproxy-cli` administers a running rproxy through its authenticated management API.
 It does not read the server TOML, open SQLite, or require a restart. The separate
@@ -31,7 +31,7 @@ Global options can appear before or after the command:
 
 The client first checks `/v1/info`, requires `management_version: 1`, and checks the
 command group's advertised capability. It never falls back to editing a database.
-Use the root token, not `RPROXY_WORKER_TOKEN`; collector access is a separate role.
+Use the root token. In0.2.4 collection runs inside rproxy; the former worker token and external collector HTTP routes are no longer accepted.
 A missing token, incompatible server, rejected mutation, failed admission, or wait
 timeout exits nonzero. Invalid CLI arguments exit 2. Errors withhold HTTP bodies,
 transport details, password values, bearer values, and import parser contents.
