@@ -7,70 +7,37 @@ fn root() -> PathBuf {
 fn yaml(name: &str) -> Value {
     serde_yaml::from_str(&fs::read_to_string(root().join(name)).unwrap()).unwrap()
 }
-fn mount<'a>(service: &'a Value, target: &str) -> &'a Value {
-    service["volumes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|volume| volume["target"] == target)
-        .unwrap_or_else(|| panic!("missing mount {target}"))
-}
-
 #[test]
-fn production_compose_is_one_hardened_service_with_private_management() {
-    let compose = yaml("compose.yaml");
-    let services = compose["services"].as_object().unwrap();
-    assert_eq!(services.keys().collect::<Vec<_>>(), vec!["rproxy"]);
-    let service = &services["rproxy"];
-    assert_eq!(service["build"]["target"], "rproxy");
-    assert_eq!(service["user"], "10001:10001");
-    assert_eq!(service["restart"], "unless-stopped");
-    assert_eq!(service["read_only"], true);
-    assert_eq!(service["cap_drop"], serde_json::json!(["ALL"]));
-    assert!(
-        service["env_file"].is_null(),
-        "provider secrets must not be process env"
-    );
-    let environment = service["environment"].as_object().unwrap();
-    assert!(!environment.contains_key("RPROXY_WORKER_TOKEN"));
-    assert!(environment.contains_key("RPROXY_ADMIN_TOKEN"));
-    for target in ["/etc/rproxy/rproxy.toml", "/etc/rproxy/providers.env"] {
-        let volume = mount(service, target);
-        assert_eq!(volume["type"], "bind");
-        assert_eq!(volume["read_only"], true);
-        assert_eq!(volume["bind"]["create_host_path"], false);
+fn single_docker_image_requires_no_compose_or_fixture() {
+    for obsolete in ["compose.yaml", "compose.https.yaml", ".env.example"] {
+        assert!(
+            !root().join(obsolete).exists(),
+            "obsolete deployment file {obsolete}"
+        );
     }
-    assert_eq!(mount(service, "/var/lib/rproxy")["type"], "volume");
-    let ports = service["ports"].as_array().unwrap();
-    assert_eq!(ports.len(), 2);
-    assert!(ports.iter().all(|port| {
-        let port = port.as_str().unwrap();
-        port.contains("127.0.0.1") && !port.contains("9100")
-    }));
-    let command = service["command"].as_array().unwrap();
+    let dockerfile = fs::read_to_string(root().join("Dockerfile")).unwrap();
+    assert!(dockerfile.contains("AS build"));
+    assert!(dockerfile.contains("AS rproxy"));
+    assert!(!dockerfile.contains("fixture"));
+    assert!(!dockerfile.contains("-p xtask"));
+    assert!(dockerfile.contains("USER 10001:10001"));
+    assert!(dockerfile.contains("rproxy-cli /usr/local/bin/"));
+    assert!(dockerfile.contains("HEALTHCHECK"));
+    assert!(!dockerfile.contains("EXPOSE 9100"));
     for value in [
         "/var/lib/rproxy/rproxy.sqlite3",
         "0.0.0.0:9099",
         "0.0.0.0:9089",
-        "0.0.0.0:9100",
     ] {
-        assert!(command.iter().any(|arg| arg == value));
+        assert!(
+            dockerfile.contains(value),
+            "missing container default {value}"
+        );
     }
-    assert!(service["healthcheck"]["test"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|arg| arg == "healthcheck"));
 }
 
 #[test]
-fn https_remains_opt_in_and_build_context_excludes_private_files() {
-    let https = yaml("compose.https.yaml");
-    let service = &https["services"]["rproxy"];
-    let certs = mount(service, "/etc/rproxy/certs");
-    assert_eq!(certs["read_only"], true);
-    assert_eq!(certs["bind"]["create_host_path"], false);
-    assert!(service["ports"][0].as_str().unwrap().ends_with(":9443"));
+fn docker_build_context_excludes_private_files_and_ci_uses_plain_docker() {
     let ignore = fs::read_to_string(root().join(".dockerignore")).unwrap();
     assert_eq!(ignore.lines().next(), Some("**"));
     for forbidden in [
@@ -86,8 +53,11 @@ fn https_remains_opt_in_and_build_context_excludes_private_files() {
     let dockerfile = fs::read_to_string(root().join("Dockerfile")).unwrap();
     assert!(!dockerfile.contains("COPY . "));
     assert!(!dockerfile.to_lowercase().contains("python"));
-    assert!(dockerfile.contains("AS test-fixture"));
-    assert!(dockerfile.contains("AS rproxy"));
+    let ci = fs::read_to_string(root().join(".github/workflows/ci.yml")).unwrap();
+    assert!(ci.contains("docker build"));
+    assert!(ci.contains("docker run"));
+    assert!(!ci.to_lowercase().contains("compose"));
+    assert!(!ci.to_lowercase().contains("podman"));
 }
 
 #[test]

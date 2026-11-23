@@ -81,7 +81,7 @@ not patch or delete it. Re-enabling does not revive revoked streams.
 
 ```sh
 rproxy-cli source import sources.toml
-rproxy-cli source import - < sources.toml # Also works through docker compose exec -T.
+rproxy-cli source import - < sources.toml # Also works through docker exec -i.
 rproxy-cli source import sources.toml --replace
 rproxy-cli source list
 rproxy-cli source show vendor

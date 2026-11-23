@@ -2,8 +2,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use xtask::{
-    compose::{self, Options},
-    fixture,
     native::{assert_native, SystemNativeGate},
     release::{package_with_gate, verify_archives, write_checksums},
 };
@@ -38,15 +36,6 @@ enum Command {
         #[arg(long)]
         target: String,
     },
-    ComposeSmoke {
-        #[arg(long, value_parser = ["docker", "podman"], default_value = "docker")]
-        engine: String,
-        #[arg(long)]
-        skip_build: bool,
-        #[arg(long, requires = "skip_build")]
-        image_prefix: Option<String>,
-    },
-    Fixture,
 }
 fn main() -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -70,19 +59,6 @@ fn main() -> Result<()> {
         }
         Command::Checksums { directory } => println!("{}", write_checksums(&directory)?.display()),
         Command::AssertNative { target } => assert_native(&target)?,
-        Command::ComposeSmoke {
-            engine,
-            skip_build,
-            image_prefix,
-        } => compose::run(
-            root,
-            Options {
-                engine,
-                skip_build,
-                image_prefix,
-            },
-        )?,
-        Command::Fixture => fixture::run()?,
     }
     Ok(())
 }

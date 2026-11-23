@@ -1,5 +1,7 @@
 # Rust-only rproxy 0.2.4
 
+> Historical design: the user subsequently removed Compose/Podman delivery and retained an optional single Docker container. The orchestration/fixture commands below are historical, not current interfaces. Use README and the2026-11-23 design for current deployment boundaries.
+
 ## User direction
 
 Continue as version **0.2.4 / v0.2.4**, remove the Python code and implement configurable collection in Rust. Preserve the existing CLI/user/source/proxy/session management, mounted configuration and five native platforms. v0.2.3 was not published because both macOS native SQLite startup checks failed; keep that tag unchanged. Fix macOS rather than bypassing the native gate.

@@ -24,18 +24,18 @@ SUPPLIER_API_TOKEN=your-private-token
 
 支持空行、注释、可选引号，不执行 shell，不做进程变量展开。文件最多1MiB。**`${ENV}` 只读取该文件，绝不回退到进程环境**；不要把 root token、`RPROXY_SOURCE_KEY` 或入口密码放进它。更改文件/启动设置需要重启原生进程或重新创建容器；来源定义在线更新无需重启。
 
-Compose 将供应商文件只读挂载为 `/etc/rproxy/providers.env`，不是 `env_file` 环境注入。空池也应保留空文件。禁用内置采集不影响手动添加候选或代理验证/转发。
+可选 Docker 部署用 `--mount` 将供应商文件只读挂载为 `/etc/rproxy/providers.env`，不是进程环境注入；只运行一个生产容器，不需要编排工具。使用示例配置时，空池也应保留空文件。禁用内置采集不影响手动添加候选或代理验证/转发。
 
 ## 在线来源管理
 
 ```sh
 cp sources.example.toml sources.toml
 # 编辑后从宿主标准输入导入：
-docker compose exec -T rproxy rproxy-cli source import - < sources.toml
-docker compose exec -T rproxy rproxy-cli source list
-docker compose exec -T rproxy rproxy-cli source resume vendor-a
-docker compose exec -T rproxy rproxy-cli source run vendor-a --wait --wait-timeout 60
-docker compose exec -T rproxy rproxy-cli source pause vendor-a
+docker exec -i rproxy rproxy-cli source import - < sources.toml
+docker exec -i rproxy rproxy-cli source list
+docker exec -i rproxy rproxy-cli source resume vendor-a
+docker exec -i rproxy rproxy-cli source run vendor-a --wait --wait-timeout 60
+docker exec -i rproxy rproxy-cli source pause vendor-a
 ```
 
 支持 `[[sources]]`、旧 `[[providers]]` TOML 和 JSON。来源仅通过显式导入进入 SQLite，不自动把文件当作第二份运行权威；普通查询/导出脱敏。来源 ID 不随重命名/同名重建复用。暂停/删除停止未来采集，默认不撤销已有代理和 stick。
@@ -105,10 +105,10 @@ Xdaili/Shenlong 等使用当前账户文档填写 URL/字段；不为 Rola 编�
 
 ## 从旧 worker 迁移
 
-1. 停止并备份原部署的整个状态目录和密钥，保留原 Compose 项目名/卷。
+1. 停止并备份原部署的整个状态目录和密钥；Docker 迁移保留原实际卷名，包括旧编排部署可能使用的项目名前缀。
 2. 服务端添加 `[collector]`；将原供应商变量迁移到专用 `providers.env`。
 3. 保留 SQLite 中已管理来源，无需重复导入。0.2.2旧 provider manifest 可用 CLI显式导入。
-4. 删除 worker token、旧 `scripts/proxy.toml` 引用和 worker 服务；确认项目后用 `up -d --build --remove-orphans` 清理该项目的旧 worker容器，绝不删除数据卷。
+4. 移除 worker token 和旧 `scripts/proxy.toml` 启动引用；确认所有权后停止自己的旧 worker。可用原生服务或直接 docker run 启动单个 rproxy 容器，沿用状态卷；不删除数据卷或无关资源。
 5. `source run --wait` / `proxy list` 检查任务及候选验证结果。
 
 更详细的实现和本地测试证据见 [internal-collector.md](internal-collector.md)。

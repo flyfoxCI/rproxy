@@ -39,17 +39,52 @@ jobs:
       - name: Test Rust workspace
         run: cargo test --locked --workspace --all-targets --jobs 1
 
-  compose:
-    name: Single-service Compose integration
+  docker:
+    name: Docker image check
     runs-on: ubuntu-22.04
     needs: test
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - name: Prepare Rust
+      - name: Build the single production image
+        run: docker build --tag rproxy-ci .
+      - name: Check both packaged programs without network access
         run: |
-          rustup update stable
-          rustup default stable
-      - name: Test managed lifecycle with owned fixtures
-        run: cargo run --locked -p xtask -- compose-smoke --engine docker
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges rproxy-ci --version
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint rproxy-cli rproxy-ci --version
+      - name: Start one offline container and exercise its management CLI
+        shell: bash
+        run: |
+          configuration="$(mktemp -d)"
+          cp rproxy.example.toml "$configuration/rproxy.toml"
+          cp providers.env.example "$configuration/providers.env"
+          export RPROXY_ADMIN_TOKEN="$(openssl rand -hex 32)"
+          export RPROXY_PASSWORD="$(openssl rand -hex 24)"
+          container=""
+          cleanup() {
+            if [[ -n "$container" ]]; then
+              docker rm --force --volumes "$container"
+            fi
+            rm -rf "$configuration"
+          }
+          trap cleanup EXIT
+          container="$(docker run -d --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --env RPROXY_ADMIN_TOKEN --env RPROXY_PASSWORD \
+            --mount "type=bind,src=$configuration/rproxy.toml,dst=/etc/rproxy/rproxy.toml,readonly" \
+            --mount "type=bind,src=$configuration/providers.env,dst=/etc/rproxy/providers.env,readonly" \
+            --volume /var/lib/rproxy rproxy-ci)"
+          ready=false
+          for attempt in {1..30}; do
+            if docker exec "$container" rproxy-cli health; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs --tail 100 "$container"
+            exit 1
+          fi
+          printf '%s\n' "$RPROXY_PASSWORD" | docker exec -i "$container" rproxy-cli user add docker-smoke --business shop --password-stdin
+          docker exec "$container" rproxy-cli user show docker-smoke

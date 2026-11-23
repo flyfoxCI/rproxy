@@ -2340,7 +2340,6 @@ name = "xtask"
 version = "0.2.4"
 dependencies = [
  "anyhow",
- "base64",
  "clap",
  "flate2",
  "rand",

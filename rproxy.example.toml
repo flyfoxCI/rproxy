@@ -4,7 +4,7 @@ database = "data/rproxy.sqlite3"
 max_proxies = 1000
 http_bind = "127.0.0.1:9099"
 socks5_bind = "127.0.0.1:9089"
-# https_bind = "0.0.0.0:9443" # Container HTTPS requires compose.https.yaml too.
+# https_bind = "0.0.0.0:9443" # Docker: also publish the port and mount the TLS files read-only.
 
 [admin]
 enabled = true

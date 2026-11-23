@@ -9,15 +9,14 @@ fn command_help_exposes_exact_tooling_contract() {
     let output = xtask().arg("--help").output().unwrap();
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
-    for command in [
-        "package",
-        "verify",
-        "checksums",
-        "assert-native",
-        "compose-smoke",
-        "fixture",
-    ] {
+    for command in ["package", "verify", "checksums", "assert-native"] {
         assert!(help.contains(command), "missing {command}: {help}");
+    }
+    for removed in ["compose-smoke", "fixture"] {
+        assert!(
+            !help.contains(removed),
+            "obsolete command {removed}: {help}"
+        );
     }
     let output = xtask().args(["package", "--help"]).output().unwrap();
     assert!(String::from_utf8(output.stdout)
@@ -26,12 +25,9 @@ fn command_help_exposes_exact_tooling_contract() {
 }
 
 #[test]
-fn compose_cli_rejects_invalid_engines_and_image_reuse_without_skip_build() {
-    for args in [
-        vec!["compose-smoke", "--engine", "sh"],
-        vec!["compose-smoke", "--image-prefix", "prebuilt"],
-    ] {
-        let output = xtask().args(args).output().unwrap();
+fn removed_container_orchestration_commands_are_rejected() {
+    for command in ["compose-smoke", "fixture"] {
+        let output = xtask().args([command, "--help"]).output().unwrap();
         assert_eq!(output.status.code(), Some(2));
     }
 }
