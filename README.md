@@ -10,11 +10,21 @@
 
 原生发布包与生产镜像只包含 **`rproxy`、`rproxy-cli` 两个程序**。
 
+## 当前实现与发布状态
+
+本文描述仓库中**已经实现的代码**，不把设计文档当成已交付功能：
+
+- 当前源码版本为 **0.2.4**，可直接构建原生二进制运行，不依赖容器；仓库也仍保留 Docker/Podman Compose 部署与集成测试。
+- **“仅原生交付、所有配置统一为一个 TOML”尚未实现**，目前只有[设计文档](https://github.com/flyfoxCI/rproxy/blob/main/docs/superpowers/specs/2026-11-23-native-single-config-v024-design.md)。
+- 当前配置仍分为服务端 `rproxy.toml`、可选的供应商变量文件 `providers.env`、显式导入的来源 manifest；`.env` 仅供 Compose 使用。来源与用户的在线修改保存在 SQLite，重启不覆盖。
+- `rproxy-cli` 目前**不读取服务端 TOML，也不支持 `--config`**；管理地址来自 `--endpoint` / `RPROXY_ADMIN_URL`，令牌来自 `--token-env` 指定的环境变量（默认 `RPROXY_ADMIN_TOKEN`）。
+- **v0.2.4 尚未公开发布 Release**。五平台归档为发布目标，不代表已生成或验证；已公开版本以 [Releases](https://github.com/flyfoxCI/rproxy/releases) 为准。
+
 ## 目录
 
 - [功能与边界](#功能与边界)
 - [Docker / Podman 快速开始](#docker--podman-快速开始)
-- [原生安装](#原生安装)
+- [原生构建与发布包](#原生构建与发布包)
 - [接入代理来源](#接入代理来源)
 - [客户端连接与选路](#客户端连接与选路)
 - [在线管理](#在线管理)
@@ -114,11 +124,40 @@ docker compose exec -T rproxy rproxy-cli proxy add http 203.0.113.10:8080 --wait
 
 采集完成仅表示候选已提交，是否可用还取决于实际出口和协议验证。来源配置见下文；接入成功后按 [客户端连接](#客户端连接与选路) 使用。
 
-## 原生安装
+## 原生构建与发布包
 
-在 [v0.2.4 Release](https://github.com/flyfoxCI/rproxy/releases/tag/v0.2.4) 选择对应归档，下载后对照 `SHA256SUMS` 验证再解压。发布是否完成以 Release 页面为准。
+### 从源码运行（当前可用）
 
-| 平台 | 归档 |
+原生运行不需要 Docker/Podman。在仓库根目录用 Rust stable 构建两个程序，Windows 程序带 `.exe`：
+
+```sh
+cargo build --release --locked -p rproxy --bins
+cp -n rproxy.example.toml rproxy.toml
+cp -n providers.env.example providers.env
+# 通过服务环境/秘密管理器设置 RPROXY_ADMIN_TOKEN，以及首次导入用的 RPROXY_PASSWORD。
+# 原生程序不会自动读取 .env。
+./target/release/rproxy --config rproxy.toml check-config
+./target/release/rproxy --config rproxy.toml serve
+```
+
+另一个终端设置同一 `RPROXY_ADMIN_TOKEN` 后运行：
+
+```sh
+./target/release/rproxy-cli health
+./target/release/rproxy-cli source import sources.toml
+./target/release/rproxy-cli source run vendor-a --wait --wait-timeout 60
+./target/release/rproxy-cli proxy list
+```
+
+先按[来源配置](#接入代理来源)准备 `sources.toml`；没有来源时也可手动添加代理。原生默认管理地址为 `http://127.0.0.1:9100`，可用 `--endpoint` 或 `RPROXY_ADMIN_URL` 修改。下文容器内的 `rproxy-cli ...` 命令均可改为直接调用原生 CLI。
+
+`check-config` 只校验启动配置，不打开数据库，不验证供应商连通性，也不要求导入凭据已就绪；运行时错误仍需查看来源状态。当前不支持将管理员令牌或来源定义直接写进服务端 TOML；管理员令牌仍由环境变量提供，来源须通过 CLI 显式导入。
+
+### 五平台发布目标（待发布）
+
+v0.2.4 的发布工作流目标如下。待 [Releases](https://github.com/flyfoxCI/rproxy/releases) 实际出现该版本及 `SHA256SUMS` 后，再下载、校验并解压；不要把本表视为发布成功的证明。
+
+| 平台 | 预期归档 |
 |---|---|
 | Linux x86_64（musl） | `rproxy-v0.2.4-x86_64-unknown-linux-musl.tar.gz` |
 | Linux ARM64（musl） | `rproxy-v0.2.4-aarch64-unknown-linux-musl.tar.gz` |
@@ -128,20 +167,7 @@ docker compose exec -T rproxy rproxy-cli proxy add http 203.0.113.10:8080 --wait
 
 Linux 可用 `sha256sum 归档文件`，macOS 用 `shasum -a 256 归档文件`，PowerShell 用 `Get-FileHash 归档文件 -Algorithm SHA256`，将结果与清单中该文件的摘要比较。macOS 最低目标为 11.0，二进制未签名/公证。
 
-解压后在包目录执行；Windows 程序带 `.exe`：
-
-```sh
-cp -n rproxy.example.toml rproxy.toml
-cp -n providers.env.example providers.env
-# 通过服务环境/秘密管理器设置 RPROXY_ADMIN_TOKEN，以及首次导入用的 RPROXY_PASSWORD。
-# 原生程序不会自动读取 .env。
-./rproxy --config rproxy.toml check-config
-./rproxy --config rproxy.toml serve
-```
-
-另一个终端设置同一 `RPROXY_ADMIN_TOKEN` 后运行 `./rproxy-cli health`。原生默认管理地址为 `http://127.0.0.1:9100`，可用 `--endpoint` 或 `RPROXY_ADMIN_URL` 修改。下文容器内的 `rproxy-cli ...` 命令均可改为直接调用原生 CLI。
-
-`check-config` 只校验启动配置，不打开数据库，不验证供应商连通性，也不要求导入凭据已就绪；运行时错误仍需查看来源状态。
+归档包含两个程序及配置示例。解压后在包目录复制示例，使用 `./rproxy --config rproxy.toml serve` 和 `./rproxy-cli ...`；配置、环境变量与来源导入要求同源码运行。
 
 ## 接入代理来源
 
