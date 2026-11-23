@@ -1,49 +1,59 @@
 # rproxy
 
-面向多个业务、登录账号的 HTTP / HTTPS / SOCKS5 代理池。**0.2.4 将配置化采集并入 Rust，使用内嵌 SQLite，生产环境只运行一个服务；不再依赖 Python、Redis 或独立 worker。**
+用 Rust 实现的 HTTP / HTTPS / SOCKS5 代理池，适合多个业务、多个登录账号需要独立且稳定出口的场景。
 
-- `rproxy`：协议入口、认证、内置异步采集、候选验证、实际出口检测、四种选路策略和持久绑定。
-- `rproxy-cli`：在线管理用户、来源、手动代理和会话，通过认证管理接口操作，不直接读写 SQLite。
-- `xtask`：仅供开发、测试和发布使用，不放进生产镜像或原生发布包。
+**v0.2.4：采集、验证、认证、选路和 SQLite 状态管理都在一个 `rproxy` 进程中运行，不再需要 Python、Redis 或独立 worker。**
 
-原生包和生产镜像均包含 **rproxy / rproxy-cli 两个二进制**。详见 [CLI 手册](docs/rproxy-cli.md)、[采集配置](docs/internal-collector.md) 和 [开发工具](https://github.com/flyfoxCI/rproxy/blob/main/docs/xtask.md)。
+- **`rproxy`**：代理入口、配置化采集、候选验证、实际出口检测、会话绑定。
+- **`rproxy-cli`**：在线管理用户、密码、业务授权、来源、手动代理和会话。
+- **`xtask`**：开发和发布工具，不进入生产镜像或原生发布包。
 
-## 能力与边界
+原生发布包与生产镜像只包含 **`rproxy`、`rproxy-cli` 两个程序**。
 
-支持 HTTP 正向代理、HTTP CONNECT、TLS 加密的 HTTPS 代理入口、SOCKS5 TCP CONNECT，以及 HTTP / SOCKS5 上游交叉组合。支持 IPv4、域名和 IPv6 目标；不解密目标 HTTPS，不做 MITM。
+## 目录
 
-同业务不同会话不能共用**实际出口 IP**，不同业务可以共享。`stick` 跨连接、认证续期和重启保留绑定；IPv4-mapped IPv6 出口按 IPv4 归一化。旧连接未排空时，旧出口不会被提前交给同业务其他会话。
+- [功能与边界](#功能与边界)
+- [Docker / Podman 快速开始](#docker--podman-快速开始)
+- [原生安装](#原生安装)
+- [接入代理来源](#接入代理来源)
+- [客户端连接与选路](#客户端连接与选路)
+- [在线管理](#在线管理)
+- [配置、数据与安全](#配置数据与安全)
+- [升级、备份与停止](#升级备份与停止)
+- [Python 功能迁移对照](#python-功能迁移对照)
+- [开发、测试与发布](#开发测试与发布)
 
-| 策略 | 新 TCP 连接的行为 |
+## 功能与边界
+
+| 功能 | 支持情况 |
 |---|---|
-| `stick` | 健康时沿用绑定，确认上游失效后记录日志并换绑 |
-| `random` | 避免上次出口；只剩旧出口时明确失败，不静默重复 |
-| `round-robin` | 在合格、未被其他会话占用的出口间轮换；单候选可重复 |
-| `shuffle` | 按会话随机不放回，一轮结束重洗，可行时避免跨轮重复 |
+| 客户端入口 | HTTP 正向代理、HTTP CONNECT、TLS 加密的 HTTPS 代理入口、SOCKS5 TCP CONNECT |
+| 上游代理 | HTTP、SOCKS5；可与不同入口交叉组合 |
+| 目标地址 | IPv4、域名、IPv6 |
+| 入口认证 | 用户名密码；也可显式启用匿名模式 |
+| 选路策略 | `stick`、`random`、`round-robin`、`shuffle` |
+| 来源采集 | 配置化 GET/POST、请求参数/头/JSON 请求体、文本/JSON 响应映射 |
+| 状态持久化 | 内嵌 SQLite，保留用户、来源、授权和会话绑定 |
+| 部署 | 单服务 Compose；或五个平台的原生二进制 |
 
-选择粒度不是单个 HTTP 请求：keep-alive 沿用当前出口，已建立的隧道不能中途迁移。不因无可用代理而直连、共享被占出口或自动降级认证，也不重放已经发送的业务请求。
+**出口隔离按实际出口 IP 判断，不只比较供应商返回的 IP:port。** 同业务的不同会话不能共用实际出口，不同业务可以共享。`stick` 绑定跨连接、认证续期和服务重启保留；旧连接未排空时，旧出口不会提前分给同业务的其他会话。
 
-**一个 SQLite 数据库只允许一个 Rust 进程持有。** 使用支持可靠文件锁的本地文件系统，不使用 NFS/SMB，不扩容共享数据库的副本。运行中不要删除/替换数据库、锁或密钥文件。Linux 锁定数据库 inode；macOS/Windows 使用旁路 `.lock` 文件，避免 macOS 文件锁与 SQLite 冲突。
+不解密目标 HTTPS，不做 MITM。不因空池而直连、不突破出口排他、不自动降级认证，也不重放已经发送的业务请求。
 
-当前不支持 SOCKS5 UDP/BIND、HTTPS 上游、上游用户名密码、供应商认证旋转网关/粘性会话参数、不可控轮换出口、网站 Cookie/登录管理或多机调度。HTTPS 代理入口不等于 HTTPS 上游。
+当前不支持 SOCKS5 UDP/BIND、HTTPS 上游、上游用户名密码、供应商认证旋转网关/粘性会话参数、不可控轮换出口、网站 Cookie/登录管理或多机调度。**HTTPS 代理入口不等于 HTTPS 上游。**
 
-## Docker / Podman Compose 一键启动
+## Docker / Podman 快速开始
 
-需要 Docker Engine/Desktop + Compose v2 或更新版本，或 Podman + 近期 Compose provider。Windows/macOS 使用 Podman 时先启动现有 machine：
+需要 Docker Engine/Desktop + Compose v2 或更新版本，或 Podman + 近期 Compose provider。以下命令在仓库根目录执行；Podman 将 `docker compose` 换成 `podman compose`。Windows/macOS 的 Podman machine 若尚未启动，先执行 `podman machine start`。
+
+### 1. 准备配置
+
+首次复制示例，已有配置不要覆盖。以下是 sh / Git Bash 命令；PowerShell 可使用 `Copy-Item`：
 
 ```sh
-podman machine start # 已启动时不用重复
-podman compose version
-```
-
-### 1. 准备宿主机文件
-
-首次在仓库根目录复制配置，**已有文件不要覆盖**；PowerShell 使用 `Copy-Item`：
-
-```sh
-cp rproxy.example.toml rproxy.toml
-cp providers.env.example providers.env
-cp .env.example .env
+cp -n rproxy.example.toml rproxy.toml
+cp -n providers.env.example providers.env
+cp -n .env.example .env
 ```
 
 用编辑器填写 `.env`：
@@ -57,23 +67,12 @@ RPROXY_SOCKS5_PORT=9089
 RPROXY_HTTPS_PORT=9443
 ```
 
-管理令牌需 16–1024 个非空白可打印 ASCII 字符；可用密码管理器或 `openssl rand -hex 32` 生成。不要把真实值写进命令参数、Git 或工单。**不再需要 `RPROXY_WORKER_TOKEN`。**
+- 管理令牌需 16–1024 个非空白可打印 ASCII 字符，可用密码管理器或 `openssl rand -hex 32` 生成。不要将真实凭据放进命令参数、Git 或工单。
+- `RPROXY_PASSWORD` 仅用于示例用户 `alice` 的一次性导入。之后 CLI 改密不会被旧 `.env`/TOML 在重启时覆盖。
+- 若要以空的 required-auth 池启动，删掉 TOML 的 `[[auth.users]]`，启动后通过 CLI 创建用户。
+- `providers.env` 只放供应商变量；暂无来源时也保留空文件供挂载。**不需要 `RPROXY_WORKER_TOKEN`。**
 
-`RPROXY_PASSWORD` 只用于示例用户的一次性导入，CLI 改密不会被旧 `.env`/TOML 在重启时覆盖。也可删掉 TOML 中的 `[[auth.users]]`，以空的 required-auth 池启动后用 CLI 新增第一个用户。
-
-示例服务配置已经包含：
-
-```toml
-[collector]
-enabled = true
-concurrency = 4
-poll_seconds = 3
-env_file = "providers.env"
-```
-
-`providers.env` 是供应商专用变量文件，**不是进程环境文件**。只填写来源需要的 `KEY=VALUE`，不要放管理员令牌、主密钥或入口密码。即使暂无来源，也保留一个空文件供只读挂载。相对路径基于服务端 TOML 的目录。
-
-### 2. 启动唯一生产服务
+### 2. 启动服务
 
 ```sh
 docker compose config --quiet
@@ -83,46 +82,107 @@ docker compose logs --tail=100 rproxy
 docker compose exec -T rproxy rproxy-cli --json health
 ```
 
-Podman 将命令前缀换成 `podman compose`。首次构建需联网；宿主机不需要 Rust 或其他语言运行时。生产 target 为 `rproxy`；`test-fixture` 只用于开发烟测，不是常驻生产服务。
+首次构建需联网，宿主机不需要 Rust 或 Python。生产环境只有一个 `rproxy` 服务，默认发布：
 
-默认仅映射 HTTP `127.0.0.1:9099` 和 SOCKS5 `127.0.0.1:9089`，管理端口 9100 不发布到宿主机。**健康不表示已有可用代理。** 新库无来源时内置采集器空闲；空池请求失败，不会绕过代理直连。
+| 入口 | 宿主地址 |
+|---|---|
+| HTTP / CONNECT | `127.0.0.1:9099` |
+| SOCKS5 | `127.0.0.1:9089` |
+| 管理 API | 不发布到宿主机，通过容器内 CLI 管理 |
+| HTTPS 代理 | 默认关闭，见 [HTTPS 入口](#https-入口与证书) |
 
-## 在线管理
+### 3. 导入来源或手动代理
 
-以下使用容器内 CLI，原生安装直接执行 `rproxy-cli ...`。原生默认管理地址 `http://127.0.0.1:9100`，支持 `--endpoint` / `RPROXY_ADMIN_URL`。`--token-env` 接受变量名，不是令牌值。`--json` 供脚本使用；失败返回非零退出码。
-
-### 用户、密码和业务授权
+**服务健康不代表已有可用代理。** 空池会拒绝业务请求，不会直连。
 
 ```sh
-# 交互输入，不回显；不要使用明文 --password。
-docker compose exec rproxy rproxy-cli user add bob --business shop --business news
-docker compose exec rproxy rproxy-cli user passwd alice
-docker compose exec -T rproxy rproxy-cli user grant bob --business shop,news
-docker compose exec -T rproxy rproxy-cli user list
-docker compose exec -T rproxy rproxy-cli user show bob
-
-docker compose exec -T rproxy rproxy-cli user disable bob --dry-run
-docker compose exec -T rproxy rproxy-cli user disable bob --yes
-docker compose exec -T rproxy rproxy-cli user enable bob
-# 明确撤销该用户已有隧道：
-docker compose exec -T rproxy rproxy-cli user disable bob --disconnect --yes
+cp -n sources.example.toml sources.toml
+# 填写 sources.toml 的真实 URL/字段映射，配置 providers.env，并设 enabled=true。
+# providers.env 在进程启动时读取；修改后先重新创建服务：
+docker compose up -d --force-recreate rproxy
+docker compose exec -T rproxy rproxy-cli source import - < sources.toml
+docker compose exec -T rproxy rproxy-cli source run vendor-a --wait --wait-timeout 60
+docker compose exec -T rproxy rproxy-cli proxy list
 ```
 
-自动化使用 `--password-stdin` 或 `--password-env 变量名`。`grant` 替换完整业务列表，清空授权意味着没有业务访问权。密码只保存 Argon2id 哈希。
-
-- 改密立即影响后续认证，但不释放或更换 stick。
-- 禁用/删除拒绝新认证；已有隧道默认排空，`--disconnect` 才明确强制断开。
-- 用户有不可变内部 ID，删除重建同名用户不会接管旧绑定。
-- **删除最后一个用户不会开放匿名。** 只有显式设置 `[auth] mode="anonymous"` 才允许匿名。
-- 管理员令牌独立，删除全部入口用户不会锁死管理接口。
-
-### 配置化来源
+也可跳过采集，手动添加真实上游：
 
 ```sh
-cp sources.example.toml sources.toml
-# 编辑 sources.toml，填写真实 URL/字段映射或 ${ENV} 引用，配置后设 enabled=true。
-# 标准输入读取宿主文件，无需向只读容器复制文件：
-docker compose exec -T rproxy rproxy-cli source import - < sources.toml
+# 以下是文档地址，必须替换为你自己的可用代理。
+docker compose exec -T rproxy rproxy-cli proxy add http 203.0.113.10:8080 --wait
+```
+
+采集完成仅表示候选已提交，是否可用还取决于实际出口和协议验证。来源配置见下文；接入成功后按 [客户端连接](#客户端连接与选路) 使用。
+
+## 原生安装
+
+在 [v0.2.4 Release](https://github.com/flyfoxCI/rproxy/releases/tag/v0.2.4) 选择对应归档，下载后对照 `SHA256SUMS` 验证再解压。发布是否完成以 Release 页面为准。
+
+| 平台 | 归档 |
+|---|---|
+| Linux x86_64（musl） | `rproxy-v0.2.4-x86_64-unknown-linux-musl.tar.gz` |
+| Linux ARM64（musl） | `rproxy-v0.2.4-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Intel | `rproxy-v0.2.4-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `rproxy-v0.2.4-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64（MSVC） | `rproxy-v0.2.4-x86_64-pc-windows-msvc.zip` |
+
+Linux 可用 `sha256sum 归档文件`，macOS 用 `shasum -a 256 归档文件`，PowerShell 用 `Get-FileHash 归档文件 -Algorithm SHA256`，将结果与清单中该文件的摘要比较。macOS 最低目标为 11.0，二进制未签名/公证。
+
+解压后在包目录执行；Windows 程序带 `.exe`：
+
+```sh
+cp -n rproxy.example.toml rproxy.toml
+cp -n providers.env.example providers.env
+# 通过服务环境/秘密管理器设置 RPROXY_ADMIN_TOKEN，以及首次导入用的 RPROXY_PASSWORD。
+# 原生程序不会自动读取 .env。
+./rproxy --config rproxy.toml check-config
+./rproxy --config rproxy.toml serve
+```
+
+另一个终端设置同一 `RPROXY_ADMIN_TOKEN` 后运行 `./rproxy-cli health`。原生默认管理地址为 `http://127.0.0.1:9100`，可用 `--endpoint` 或 `RPROXY_ADMIN_URL` 修改。下文容器内的 `rproxy-cli ...` 命令均可改为直接调用原生 CLI。
+
+`check-config` 只校验启动配置，不打开数据库，不验证供应商连通性，也不要求导入凭据已就绪；运行时错误仍需查看来源状态。
+
+## 接入代理来源
+
+来源定义通过 CLI 显式导入 SQLite，**不会自动加载 `sources.toml`**。支持新 `[[sources]]`、旧 `[[providers]]` TOML 和 JSON manifest。已有托管来源无需在重启时重导入。
+
+### 供应商变量与通用映射
+
+服务端 `rproxy.toml` 已包含：
+
+```toml
+[collector]
+enabled = true
+concurrency = 4      # 1..64，同时运行的来源任务数
+poll_seconds = 3     # 1..300，计划刷新间隔；各来源另有自己的采集周期
+env_file = "providers.env" # 相对本 TOML 的目录
+```
+
+用编辑器在 `providers.env` 填写供应商 URL/令牌；来源中的 `${SUPPLIER_API_URL}` 等引用只从这个文件解析，**不读取进程环境**。不要放管理员令牌、主密钥或入口密码。文件支持 UTF-8 `KEY=VALUE`、注释、引号，不执行 shell；修改后需重启原生进程或重新创建容器。
+
+`sources.example.toml` 提供完整文本接口模板。JSON 接口按供应商当前返回结构修改映射，例如：
+
+```toml
+[sources.config.response]
+format = "json"
+items_path = "data.proxies"
+ip_path = "ip"
+port_path = "port"
+success_path = "code"
+success_value = 0
+# 若数组元素直接包含完整端点，去掉 ip_path/port_path，改用 address_path="endpoint"。
+```
+
+支持 GET/POST、query params、headers、POST JSON 请求体；文本按空白/逗号/分号拆分；JSON 路径支持点号和数字数组下标。只接收数字 IPv4/IPv6 和合法端口，IPv6 使用 `[地址]:端口`，提取后规范化去重。
+
+默认每来源 60 秒周期、每次尝试 10 秒预算、最多 3 次尝试；解压后响应最多 1 MiB、每次最多 4096 个地址、每批 256 个候选。超时覆盖请求和响应体读取；传输失败有界重试，映射错误不重试。禁重定向和系统代理，TLS 默认验证。
+
+Xdaili、Shenlong 等均按当前账户接口填写 URL/映射，不再编写供应商类。Rola 仅在账户提供 IP 白名单提取接口时可配置接入；不猜测其 API，也不声称支持认证旋转网关或供应商粘性会话参数。完整配置与边界见 [采集手册](docs/internal-collector.md)。
+
+### 在线操作
+
+```sh
 docker compose exec -T rproxy rproxy-cli source list
 docker compose exec -T rproxy rproxy-cli source show vendor-a
 docker compose exec -T rproxy rproxy-cli source resume vendor-a
@@ -132,27 +192,63 @@ docker compose exec -T rproxy rproxy-cli source pause vendor-a
 docker compose exec -T rproxy rproxy-cli source remove vendor-a --yes
 ```
 
-SQLite 是运行时来源权威；支持新 `[[sources]]`、旧 `[[providers]]` TOML 及 JSON manifest 的显式导入。修改、暂停和手动执行来源不需重启。旧版本/旧 run generation 的迟到结果会被拒绝，暂停/删除默认不撤销已有代理或 stick。
+来源变更在线生效，旧版本/旧执行代次的迟到结果会被拒绝。暂停或删除停止采集，默认保留已有代理和 stick；撤回候选是独立的 proxy 操作。普通查询/导出脱敏，`${ENV}` 引用保留。安全错误类别为 `env-missing`、`mapping-failed`、`fetch-failed`，不会回显供应商 URL、请求内容或凭据。
 
-GET/POST、params/headers/JSON 请求体、文本/JSON 字段路径等均通过配置实现，不为每家供应商写一个类。`${SUPPLIER_API_URL}` 等引用**只从 `collector.env_file` 解析**，不存在时返回 `env-missing`，不会回退读取进程中的 root token/master key。修改此文件后重新创建 rproxy；来源定义本身在线生效。
+## 客户端连接与选路
 
-```sh
-docker compose up -d --force-recreate rproxy
+代理用户名格式：
+
+```text
+v1|入口用户名|业务标识|会话标识|策略
 ```
 
-来源配置整体加密保存。默认在状态目录生成 `.sqlite3.key` 私有文件（Unix 0600），密钥不在 SQLite；也可在受控服务环境中显式注入 base64 编码的 32 字节 `RPROXY_SOURCE_KEY`。丢失/错误密钥会拒绝启动，不会重置数据。普通查询/导出脱敏：
+例如 `v1|alice|shop|account-a|stick`：用入口用户 `alice` 的密码认证，在业务 `shop` 下为 `account-a` 保持出口。**不同网站账号使用不同会话**，业务必须在用户授权列表中。
+
+各标识为 1–64 个 ASCII 字母数字或 `._-`，完整用户名最多 255 字节。普通用户名使用首个允许业务和默认会话/策略。放进代理 URL 时须编码用户名/密码；独立认证字段使用原值。
 
 ```sh
-docker compose exec -T rproxy rproxy-cli source export > redacted-sources.json
+# 只指定用户名，让 curl 提示输入代理密码，避免真实密码进入命令参数。
+curl --proxy http://127.0.0.1:9099 --proxy-user 'v1|alice|shop|account-a|stick' https://example.com/
+curl --proxy socks5h://127.0.0.1:9089 --proxy-user 'v1|alice|shop|account-a|stick' https://example.com/
 ```
 
-完整秘密导出必须显式 `--include-secrets --output 私有文件 --yes`，不输出到 stdout，不覆盖已有文件。来源采集完成不表示候选已经验证可用。Xdaili/Shenlong 映射需按当前接口核对；Rola 仅在账户提供 IP 白名单提取接口时配置真实 URL/映射，不猜测 API，不声称支持认证旋转网关。
+| 策略 | 每个新 TCP 连接的行为 |
+|---|---|
+| `stick` | 健康时沿用绑定；确认上游失效后记录日志并自动换绑 |
+| `random` | 避免上次出口；只剩旧出口时明确失败，不静默重复 |
+| `round-robin` | 在合格且未被同业务其他会话占用的出口间轮换；单候选可重复 |
+| `shuffle` | 按会话随机不放回，一轮结束重洗，可行时避免跨轮重复 |
+
+选路粒度不是单个 HTTP 请求：keep-alive 沿用当前出口，已建立的隧道不能中途迁移。认证固定 TTL 到期会重新验证，但不释放 stick，也不强行关闭既有隧道；显式撤销除外。部分浏览器不支持 SOCKS5 用户名密码，可改用 HTTP/HTTPS 入口。
+
+## 在线管理
+
+容器部署用 `docker compose exec rproxy rproxy-cli ...`；无交互命令可加 `-T`。原生直接执行 CLI。`--json` 供脚本使用，失败返回非零退出码；`--token-env` 接收变量名，不接收令牌值。完整命令见 [CLI 手册](docs/rproxy-cli.md)。
+
+### 用户、密码与业务授权
+
+```sh
+# 隐藏输入密码，不使用明文 --password 参数。
+docker compose exec rproxy rproxy-cli user add bob --business shop --business news
+docker compose exec rproxy rproxy-cli user passwd alice
+docker compose exec -T rproxy rproxy-cli user grant bob --business shop,news
+docker compose exec -T rproxy rproxy-cli user list
+docker compose exec -T rproxy rproxy-cli user show bob
+docker compose exec -T rproxy rproxy-cli user disable bob --dry-run
+docker compose exec -T rproxy rproxy-cli user disable bob --yes
+docker compose exec -T rproxy rproxy-cli user enable bob
+# 明确撤销已有连接：
+docker compose exec -T rproxy rproxy-cli user disable bob --disconnect --yes
+```
+
+自动化使用 `--password-stdin` 或 `--password-env 变量名`。`grant` 替换完整业务列表；空列表表示无业务访问权。密码只保存 Argon2id 哈希。
+
+改密不释放 stick；禁用/删除默认拒绝新认证，让旧连接排空，`--disconnect` 才强制断开。用户 ID 不可变，删除重建同名用户不会接管旧绑定。**删除最后一个用户不会开放匿名，也不会锁死独立令牌保护的管理接口。** 匿名必须显式设置 `[auth] mode="anonymous"`。
 
 ### 手动代理与会话
 
 ```sh
 # 文档 IP 必须替换成真实上游；IPv6 使用 [地址]:端口。
-docker compose exec -T rproxy rproxy-cli proxy add http 203.0.113.10:8080 --wait
 docker compose exec -T rproxy rproxy-cli proxy add socks5 203.0.113.20:1080 --source manual
 docker compose exec -T rproxy rproxy-cli proxy import http - --wait < addresses.txt
 docker compose exec -T rproxy rproxy-cli proxy list --protocol http
@@ -160,91 +256,121 @@ docker compose exec -T rproxy rproxy-cli proxy show 'http:203.0.113.10:8080'
 docker compose exec -T rproxy rproxy-cli proxy verify
 docker compose exec -T rproxy rproxy-cli proxy disable 'http:203.0.113.10:8080' --dry-run
 docker compose exec -T rproxy rproxy-cli proxy remove 'http:203.0.113.10:8080' --yes
-
 docker compose exec -T rproxy rproxy-cli session list --business shop
 docker compose exec -T rproxy rproxy-cli session release shop account-a --dry-run
 docker compose exec -T rproxy rproxy-cli session release shop account-a --yes
 ```
 
-提交是幂等候选添加，**不是免检准入**。`--wait` 对拒绝/超时返回非零；实际出口、稳定性和 CONNECT 能力由 Rust 验证。同一协议/地址可关联多个来源。`probe.enabled=false` 只关闭定期检测，新候选和重启遗留候选仍需验证。
+添加代理是幂等提交候选，**不是免检准入**。`--wait` 对拒绝/超时返回非零。同一协议/地址可关联多个来源。`probe.enabled=false` 只关闭定期检测，新候选和重启遗留候选仍需验证。
 
-管理员释放会话不需要用户密码；旧连接排空前仍保护出口，强制断开需显式选择。删除用户不静默释放其全部 stick。
+管理员释放会话不需要用户密码；旧连接排空前仍保护出口，强制断开需显式加 `--disconnect`。删除用户不静默释放其全部 stick。
 
-## 配置、挂载与 TLS
+## 配置、数据与安全
 
-| 数据 | 权威来源 | 如何变更 |
-|---|---|---|
-| 监听、TLS、认证模式、限额、采集并发/轮询/变量文件路径 | 宿主 `rproxy.toml` → `/etc/rproxy/rproxy.toml`，只读 | 重新创建 rproxy |
-| 用户、授权、来源、手动代理、绑定 | 命名卷 `/var/lib/rproxy` 的 SQLite | CLI 在线操作 |
-| 管理令牌/首次导入密码 | `.env` 指定注入 | 改动后重新创建；旧用户不被覆写 |
-| 供应商变量 | 宿主 `providers.env` → `/etc/rproxy/providers.env`，只读 | 重新创建 rproxy |
-| HTTPS/自定义 CA 证书 | 显式只读挂载目录 | 重新创建 rproxy |
+| 文件/数据 | 用途与变更方式 |
+|---|---|
+| `rproxy.toml` | 监听、TLS、认证模式、限额、采集调度；修改后重启原生进程/重新创建容器 |
+| `providers.env` | 供应商变量的私有映射，只读挂载；修改后重启/重新创建 |
+| `.env` | Compose 注入管理员令牌、首次导入密码及端口/路径；原生程序不读取 |
+| SQLite 与 `.key` | 可变管理数据的权威来源；用户、授权、来源、手动代理和绑定通过 CLI 在线变更 |
+| 证书目录 | HTTPS 入口或自定义 CA；需显式只读挂载 |
 
-Compose 固定内部 HTTP/SOCKS5/管理监听 `0.0.0.0:9099/9089/9100` 和数据库 `/var/lib/rproxy/rproxy.sqlite3`。外部端口/绑定 IP 用 `.env` 调整。宿主路径可用 `RPROXY_CONFIG`、`RPROXY_PROVIDERS_ENV`、`RPROXY_CERTS_DIR` 指定。重新创建能处理编辑器原子替换 inode；单独 restart 不重新注入环境。
+Compose 把启动文件挂载到 `/etc/rproxy/`，状态卷挂载到 `/var/lib/rproxy`，内部 HTTP/SOCKS5/管理监听固定为 `0.0.0.0:9099/9089/9100`。外部端口/绑定 IP 在 `.env` 调整；宿主路径可用 `RPROXY_CONFIG`、`RPROXY_PROVIDERS_ENV`、`RPROXY_CERTS_DIR` 指定。`up -d --force-recreate rproxy` 会重新注入环境、更新挂载 inode；单独 `restart` 不会重新注入环境。
 
-容器使用 `10001:10001`、只读根文件系统和最小权限；确保专用配置/证书可读、状态卷可写，不使用 chmod777。缺文件时 `create_host_path:false` 拒绝启动。部分 Compose provider 不转发 SELinux `Z`，enforcing 环境应给专用文件设置正确容器标签，不关闭 SELinux 或重标系统目录。
+容器使用 `10001:10001`、只读根文件系统和最小权限。确保配置/证书可读、状态卷可写，不使用 chmod777；缺失挂载文件会拒绝启动，不自动创建目录。部分 Compose provider 不转发 SELinux `Z`，enforcing 环境应为专用文件设置容器标签，不关闭 SELinux 或重标系统目录。
 
-可选 HTTPS 入口：准备 `certs/fullchain.pem` / `certs/private-key.pem`，TOML 顶层启用 `https_bind="0.0.0.0:9443"` 并设置 `[tls]` 的 `certificate="certs/fullchain.pem"`、`private_key="certs/private-key.pem"`：
+**一个数据库只允许一个进程持有。** 使用有可靠文件锁的本地文件系统，不使用 NFS/SMB，不通过共享数据库扩容副本。Linux 锁定数据库 inode；macOS/Windows 使用旁路 `.lock`。运行中不要删除/替换数据库、锁或密钥文件。
+
+### 来源加密与导出
+
+来源配置整体加密保存。默认在数据库旁生成私有 `.sqlite3.key` 文件（Unix 0600），密钥不在 SQLite；也可通过受控服务环境注入标准 base64 编码的 32 字节 `RPROXY_SOURCE_KEY`。错误/丢失密钥会失败关闭，不会重置数据。
+
+```sh
+docker compose exec -T rproxy rproxy-cli source export > redacted-sources.json
+```
+
+普通导出脱敏，不是完整凭据备份。完整秘密导出必须指定 `--include-secrets --output 私有文件 --yes`，路径属于 **CLI 运行所在环境**，不写 stdout、不覆盖已有文件；容器只读根文件系统下须选择显式准备的可写私有路径。备份数据库时还必须保存其加密密钥。
+
+### HTTPS 入口与证书
+
+准备 `certs/fullchain.pem` / `certs/private-key.pem`，在 TOML **顶层**启用 `https_bind="0.0.0.0:9443"`，并设置：
+
+```toml
+[tls]
+certificate = "certs/fullchain.pem"
+private_key = "certs/private-key.pem"
+```
 
 ```sh
 docker compose -f compose.yaml -f compose.https.yaml up -d --build
 ```
 
-后续始终带同样两个 `-f`。仅发布端口不会启用 TLS；证书错误拒绝启动，不降级。自签名入口需客户端显式信任（curl `--proxy-cacert`）；目标 HTTPS 仍由客户端验证。普通 HTTP Basic / SOCKS5 密码不加密，跨不可信网络用 HTTPS 入口或安全通道。管理接口不要裸露公网。
+后续始终带这两个 `-f`。只发布端口不会启用 TLS；证书错误拒绝启动，不降级。自签名入口需客户端显式信任（curl `--proxy-cacert`）；目标 HTTPS 证书仍由客户端验证。普通 HTTP Basic / SOCKS5 密码不加密，跨不可信网络应使用 HTTPS 入口或安全通道，管理 API 不要裸露公网。
 
-采集器供应商 CA 与 `[probe] ca_certificate` 分开配置，相对路径均基于服务端 TOML；自定义 CA 需显式只读挂载。默认校验证书，供应商 `insecure=true` 是明确例外，不影响客户端 TLS 隧道。
+供应商 `ca_certificate` 与 `[probe] ca_certificate` 分开配置，相对路径基于服务端 TOML，自定义 CA 需显式只读挂载。供应商 `insecure=true` 是显式证书例外，不影响客户端 TLS 隧道；优先配置受信任 CA。
 
-## 标准客户端
+## 升级、备份与停止
 
-用户名格式：`v1|入口用户名|业务标识|会话标识|策略`。标识为1–64个 ASCII 字母数字或 `._-`，完整用户名最多255字节；普通用户名使用首个允许业务和默认会话/策略。不同网站账号使用不同会话。
-
-```sh
-curl --proxy http://127.0.0.1:9099 --proxy-user 'v1|alice|shop|account-a|stick:YOUR_PASSWORD' https://example.com/
-curl --proxy socks5h://127.0.0.1:9089 --proxy-user 'v1|alice|shop|account-a|stick:YOUR_PASSWORD' https://example.com/
-```
-
-放进 URL 时编码用户名/密码，独立认证字段使用原始值。部分浏览器不支持 SOCKS5 用户名密码，可改用 HTTP/HTTPS 入口。认证 TTL 与绑定独立，固定 TTL 到期重新验证不更换 IP；不会强行关闭已经建立的隧道，显式撤销除外。
-
-## 升级、停止与备份
-
-**从0.2.3源码/候选构建升级：** 保留 schema2 数据库、密钥、用户/来源 ID 和 stick；无需重导入已管理来源。停止旧部署并备份，向 `rproxy.toml` 添加 `[collector]`；将原 `scripts/providers.env` 的供应商变量安全迁移到新的 `providers.env`。删除 `.env` 的 worker token 和旧 worker 启动配置引用；`admin.worker_token_env` 仅兼容解析，已不具认证作用。旧 `/v1/collector/*` HTTP 接口已移除。使用原 Compose 项目名和卷，确认后以 `up -d --build --remove-orphans` 移除该项目的旧 collector 容器；不删除卷。
-
-**从0.2.2升级：** 先停止备份；SQLite 会迁移旧用户归属并保留绑定，TOML 用户只导入一次。旧 provider TOML 用 CLI 显式导入，不再作为独立采集配置。回退旧 schema 版本需恢复升级前备份。
-
-**Redis版0.2.1及以前：** 需要维护窗口并重新导入候选，不自动迁移 Redis stick/占用，不承诺保留旧出口。
+先停止旧部署并备份完整状态目录和宿主配置，始终保留相同 Compose 项目名和卷。下面示例使用新的空备份目录，已有备份不要覆盖：
 
 ```sh
-docker compose down             # 保留卷和宿主文件；不要加 -v
-docker compose up -d --build
-# 备份：先停止，复制整个状态目录（含 WAL、.key）和宿主配置。
-mkdir -p backup
+mkdir backup-v024
 docker compose stop rproxy
-docker compose cp rproxy:/var/lib/rproxy ./backup/
-docker compose up -d
+docker compose cp rproxy:/var/lib/rproxy ./backup-v024/
+# 另行安全备份 rproxy.toml、.env、providers.env、证书，以及显式提供的主密钥。
 ```
 
-不要运行中只复制 SQLite 主文件，不要更换 Compose 项目名造成空卷。损坏、未知 schema 或无法解密时失败关闭，不自动清空重建。`data/`、私有配置及旧本地虚拟环境不会被升级脚本删除。
+不要运行中只复制 SQLite 主文件；保存整个状态目录，包括存在的 WAL 和 `.key`。若旧部署包含外部 collector，也先停止它，避免备份过程中继续写入。
 
-## 原生构建、验证与发布
+| 升级来源 | 处理方式 |
+|---|---|
+| 0.2.3 源码/候选构建 | 保留 schema2、用户/来源 ID、密钥和 stick，无需重新导入托管来源；添加 `[collector]`，迁移供应商变量，移除 worker 配置 |
+| 0.2.2 | 保留停止后的完整备份；升级迁移旧用户归属并保留绑定，TOML 用户只导入一次；旧 provider TOML 用 CLI 显式导入 |
+| Redis 版 0.2.1 及以前 | 需要维护窗口、重新导入候选；不自动迁移 Redis stick/占用，不承诺保留旧出口 |
+
+旧 `scripts/providers.env` 的变量需安全迁到新 `providers.env`；删除 `.env` 的 worker token 和旧 worker 启动引用。`admin.worker_token_env` 只兼容解析，不再授权；旧 `/v1/collector/*` HTTP 接口已移除，重启旧 worker 无法恢复采集。
+
+确认当前项目后执行 `docker compose up -d --build --remove-orphans`，移除**该项目**的旧 collector 容器，不删除卷。随后检查 `health`、`source run --wait` 和 `proxy list`。
+
+```sh
+docker compose down  # 停止并保留卷/宿主文件，不要加 -v
+docker compose up -d --build
+```
+
+不要更换项目名而意外使用空卷。回退旧 schema 版本需恢复升级前备份。损坏、未知 schema 或无法解密时拒绝启动，不清空重建；用户的 `data/`、私有配置和旧虚拟环境不会被自动删除。
+
+## Python 功能迁移对照
+
+**生产采集能力已迁入 Rust；不是保留 Python 命令行和测试依赖的逐字移植。**
+
+| 原 Python 能力/工具 | v0.2.4 对应实现 |
+|---|---|
+| 通用 GET/POST、参数/请求头/JSON 请求体 | 内置 Rust collector，沿用来源配置字段 |
+| 文本/JSON 映射、成功标记、数组路径、IPv4/IPv6、去重 | 内置映射与校验；无供应商专用类 |
+| 来源周期、并发、重试、超时、TLS/CA、响应和批次上限 | Tokio 调度与有界 HTTP 请求；支持取消过期任务和关闭时清理 |
+| `${ENV}` 供应商引用 | 保留引用语法，但只读取专用 `providers.env`，不再读取通用进程环境 |
+| 独立 worker、令牌、plan/results HTTP 回传 | 删除；同进程 typed Store 提交，保留来源版本/执行代次校验 |
+| worker `--once` / `--check-config` | 按来源用 `rproxy-cli source run --wait`；启动配置用 `rproxy check-config`，不保留独立 worker CLI 或全来源 `--once` 命令 |
+| 打包、归档校验、SHA256SUMS | Rust `xtask package / verify / checksums`，继续覆盖五平台和两个程序 |
+| Compose 生命周期、HTTP/SOCKS fixture | Rust `xtask compose-smoke / fixture`，只创建和清理自己的资源 |
+| Python 单元测试与协议烟测 | Rust workspace 测试和协议/TLS 集成测试；未原样保留 requests/可选 Playwright 驱动的客户端矩阵，不据此宣称重新验证过真实浏览器 |
+
+仓库不再跟踪 `.py` 或 requirements 文件，CI/Release 不安装 Python。旧私有 Python 环境不参与运行，也不自动删除。
+
+## 开发、测试与发布
+
+从源码构建两个生产程序：
 
 ```sh
 cargo build --release --locked -p rproxy --bins
-cp rproxy.example.toml rproxy.toml
-cp providers.env.example providers.env
-# 在服务环境设置 RPROXY_ADMIN_TOKEN 及首次bootstrap的 RPROXY_PASSWORD；不自动读取.env。
-./target/release/rproxy --config rproxy.toml check-config
-./target/release/rproxy --config rproxy.toml
-# 另一个终端使用同一 root token：
-./target/release/rproxy-cli user list
-
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
-cargo run --locked -p xtask -- compose-smoke --engine podman # 或docker
+cargo run --locked -p xtask -- compose-smoke --engine podman # 或 docker
 ```
 
-Windows 使用 `.exe`；本机 GNU toolchain 需 MinGW 工具在 PATH，低内存用 `-j1`。`check-config` 不打开 SQLite、不要求密钥环境值；首次启动/迁移才解析导入凭据。旧 `healthcheck/add-proxy/verify-pool/release-session` 命令保留，新管理操作优先 CLI。
+Windows GNU toolchain 需 MinGW 在 PATH；低内存环境给 Cargo 加 `-j1`。旧 `healthcheck/add-proxy/verify-pool/release-session` 命令保留，新的管理操作优先使用独立 CLI。
 
-Compose 烟测只使用随机项目、临时配置、本地受限 HTTP/SOCKS5 fixture 和自己的卷，结束只清理自身资源。原生发布门禁运行本次构建的两个可信二进制，执行真实 SQLite 启动及 CLI 用户创建/读取；不执行下载或归档中的程序。
+Release 工作流先验证完整 workspace 和真实 Compose，再在五个原生 runner 编译。打包前检查两个程序版本、真实 SQLite 启动与 CLI 创建/读取用户；两个 macOS job 额外执行 SQLite 锁回归。最后验证完整五归档集合、文件类型/路径/权限和 SHA256SUMS，全部通过才把 draft 发布。归档验证不执行下载或归档中的程序，已公开版本不覆盖。
 
-0.2.4 的发布目标为 Linux x86_64/ARM64 musl、macOS Intel/Apple Silicon（11.0+，未签名/公证）、Windows x86_64 MSVC，五个归档和 SHA256SUMS。`xtask verify` 检查完整集合、两可执行文件及归档路径/类型，再允许 draft 发布。详见 [0.2.4 变更](https://github.com/flyfoxCI/rproxy/blob/main/docs/releases/v0.2.4.md)；是否已发布以 [Releases](https://github.com/flyfoxCI/rproxy/releases) 为准。历史标签/发行版不覆盖，v0.2.3 保持未发布，不移动标签。
+详见 [开发/发布工具](https://github.com/flyfoxCI/rproxy/blob/main/docs/xtask.md)、[v0.2.4 变更](https://github.com/flyfoxCI/rproxy/blob/main/docs/releases/v0.2.4.md) 和 [Releases](https://github.com/flyfoxCI/rproxy/releases)。历史 `v0.2.3` 标签保持不变且不发布。

@@ -98,7 +98,8 @@ rproxy-cli source export --include-secrets --output private-sources.json --yes
 Imports accept the old collector `[[providers]]` format, new `[[sources]]` TOML,
 or JSON `{ "schema_version": 1, "sources": [...] }`. Legacy provider fields become
 `config`; name/enabled/kind are source metadata. Environment references such as
-`${SUPPLIER_URL}` are preserved literally for the worker to resolve. Source files
+`${SUPPLIER_URL}` are preserved literally for the internal Rust collector to
+resolve from its dedicated `collector.env_file`, never the process environment. Source files
 are parsed locally, not executed. All entries are validated before the first
 mutation; subsequent server failures can still leave earlier entries saved, so
 inspect the list before retrying.
