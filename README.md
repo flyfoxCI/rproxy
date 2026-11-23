@@ -2,7 +2,7 @@
 
 Rust 实现的 HTTP / HTTPS / SOCKS5 代理池，适合多个业务、多个登录账号需要独立且稳定出口的场景。
 
-**当前源码版本为 0.2.4：采集、验证、认证、选路和 SQLite 状态管理都在一个 `rproxy` 进程中运行，不依赖 Python、Redis 或独立 worker。**
+**当前源码版本为 0.2.4：采集、验证、认证、选路和内嵌 SQLite 状态管理统一在一个 `rproxy` 进程中运行。**
 
 - **`rproxy`**：代理入口、配置化采集、候选验证、实际出口检测与会话绑定。
 - **`rproxy-cli`**：在线管理用户、密码、业务授权、来源、手动代理和会话。
@@ -27,7 +27,6 @@ Rust 实现的 HTTP / HTTPS / SOCKS5 代理池，适合多个业务、多个登�
 - [在线管理](#在线管理)
 - [配置、密钥与 TLS](#配置密钥与-tls)
 - [升级、备份与停止](#升级备份与停止)
-- [Python 功能迁移](#python-功能迁移)
 - [开发、测试与发布](#开发测试与发布)
 
 ## 功能与边界
@@ -83,7 +82,7 @@ cp -n providers.env.example providers.env
 
 ## 可选：单个 Docker 容器
 
-只需 Docker Engine/Desktop。镜像包含同样的两个生产程序，不包含 Python、xtask 或额外服务。
+只需 Docker Engine/Desktop。镜像只包含上述两个生产程序，不包含开发工具或额外服务。
 
 ### 首次启动
 
@@ -284,7 +283,7 @@ docker stop rproxy
 docker cp rproxy:/var/lib/rproxy ./backup-v024/
 ```
 
-如果旧部署还有外部 worker，也先停止它。旧编排部署的卷名可能带项目名前缀；迁移到 `docker run` 时必须使用那个**实际卷名**，不删除卷、不悄悄换成新的 `rproxy-data`。
+升级前停止旧部署的所有服务。旧编排部署的卷名可能带项目名前缀；迁移到 `docker run` 时必须使用那个**实际卷名**，不删除卷、不悄悄换成新的 `rproxy-data`。
 
 | 升级来源 | 行为 |
 |---|---|
@@ -292,17 +291,9 @@ docker cp rproxy:/var/lib/rproxy ./backup-v024/
 | 0.2.2 | 迁移旧用户归属并保留绑定；TOML 用户只导入一次，旧来源 manifest 显式导入 |
 | Redis 版0.2.1及以前 | 维护窗口后重新导入候选；不自动迁移 Redis stick/占用，不承诺保留旧出口 |
 
-旧 worker token、独立 worker 配置及 `/v1/collector/*` HTTP 接口均已退役；`admin.worker_token_env` 仅兼容解析，不授权请求。不要继续启动旧 worker。回退旧 schema 版本需恢复升级前备份。
+旧版本的接口变化和迁移细节见 [v0.2.4 变更](https://github.com/flyfoxCI/rproxy/blob/main/docs/releases/v0.2.4.md)。回退旧 schema 版本需恢复升级前备份。
 
-用户真实 `data/`、私有配置、旧环境文件和虚拟环境不自动删除。停止/重建只针对自己的进程或容器，保留数据卷。
-
-## Python 功能迁移
-
-生产采集的 GET/POST、请求映射、文本/JSON 解析、IPv4/IPv6、去重、周期、并发、重试、超时、TLS 和候选分批提交均已迁入 Rust。`${ENV}` 改为只读取专用供应商文件，外部 worker HTTP 回传改为 typed Store 调用。
-
-worker `--once` 用每来源的 `rproxy-cli source run --wait` 替代，没有全来源 `--once`。打包和校验改用 Rust xtask。协议/TLS、采集、状态和管理生命周期由 Rust 集成测试覆盖；不声称重新运行过旧 requests/可选 Playwright 客户端矩阵。
-
-仓库不再跟踪 Python 源码或 requirements。容器编排工具及其专用 fixture 已移除，不进入开发/发布流程。
+用户真实 `data/` 和私有配置不自动删除。停止/重建只针对自己的进程或容器，保留数据卷。
 
 ## 开发、测试与发布
 
